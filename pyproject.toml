@@ -1,0 +1,60 @@
+[project]
+name = "jobs-status-manager"
+version = "0.1.0"
+description = "Phase 0 foundation for a job status manager"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "alembic>=1.14,<2",
+    "chromadb>=1.0,<2",
+    "httpx2[brotli,http2,zstd]>=2.12.0",
+    "pydantic-settings>=2.7,<3",
+    "pypdf>=6,<7",
+    "python-docx>=1.2,<2",
+    "sqlalchemy>=2.0,<3",
+    "starlette>=0.41,<1",
+    "structlog>=24.4,<26",
+    "typer>=0.15,<1",
+    "uvicorn>=0.34,<1",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.31,<2",
+    "httpx>=0.28,<1",
+    "pytest>=8.3,<10",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+jobs-status-manager = "jobs_status_manager.__main__:main"
+
+[tool.uv]
+package = true
+
+[tool.basedpyright]
+typeCheckingMode = "basic"
+pythonVersion = "3.12"
+include = ["src", "tests"]
+exclude = ["**/__pycache__", ".venv"]
+reportCallIssue = "none"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["COM812", "ISC001", "D203", "D213", "CPY001", "FBT001", "FBT002", "TD002", "TD003", "FIX002"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "ARG", "PLR2004", "SLF001", "D"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+filterwarnings = [
+    "error",
+    "ignore:The anyio.abc.BlockingPortal alias is deprecated:DeprecationWarning:starlette.testclient",
+]
