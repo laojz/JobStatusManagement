@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from typing import TYPE_CHECKING, assert_never
 
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 
-from jobs_status_manager.agent.contracts import AgentRunState
+from jobs_status_manager.agent.contracts import AgentRunState, ProviderErrorKind
 from jobs_status_manager.agent.models import AgentRun, ToolResult
 from jobs_status_manager.agent.tools import WRITE_TOOL_NAME, WriteToolName
 from jobs_status_manager.agent.write_contracts import (
@@ -162,12 +163,30 @@ def record_confirmation_delivery(
     *,
     success: bool,
     error: str | None = None,
+    provider_error_kind: ProviderErrorKind | None = None,
 ) -> None:
     """Persist whether the user received the confirmation prompt."""
     with transaction(services.database) as session:
         run = session.get(AgentRun, run_id)
         if run is not None:
-            run.delivery_state = "SENT" if success else "FAILED"
+            if success:
+                run.delivery_state = "SENT"
+                run.next_retry_at = None
+            elif (
+                provider_error_kind is ProviderErrorKind.RETRYABLE
+                and run.attempt_count < services.max_delivery_attempts
+            ):
+                run.delivery_state = "RETRY_WAIT"
+                run.next_retry_at = services.clock.now() + timedelta(minutes=5)
+            elif provider_error_kind is ProviderErrorKind.AMBIGUOUS:
+                run.delivery_state = "AMBIGUOUS"
+                run.next_retry_at = None
+            elif provider_error_kind in (ProviderErrorKind.PERMANENT, ProviderErrorKind.DEFINITE):
+                run.delivery_state = "PERMANENT"
+                run.next_retry_at = None
+            else:
+                run.delivery_state = "FAILED"
+                run.next_retry_at = None
             run.delivery_error = error
 
 

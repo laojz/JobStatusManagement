@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, assert_never
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
-from jobs_status_manager.agent.contracts import AgentRunState
+from jobs_status_manager.agent.contracts import AgentRunState, ProviderErrorKind
 from jobs_status_manager.agent.models import AgentRun, ConversationMessage
 from jobs_status_manager.agent.models import Session as AgentSession
 from jobs_status_manager.agent.write_runtime import (
@@ -25,12 +25,19 @@ if TYPE_CHECKING:
 
 def retry_confirmation_prompts(services: RuntimeServices) -> int:
     """Retry persisted prompts for waiting runs whose delivery is incomplete."""
+    now = services.clock.now()
     with transaction(services.database) as session:
         runs = list(
             session.scalars(
                 select(AgentRun).where(
                     AgentRun.state == AgentRunState.WAITING_USER_CONFIRMATION.value,
-                    AgentRun.delivery_state != "SENT",
+                    or_(
+                        AgentRun.delivery_state.is_(None),
+                        AgentRun.delivery_state == "FAILED",
+                        AgentRun.delivery_state == "RETRY_WAIT",
+                    ),
+                    or_(AgentRun.next_retry_at.is_(None), AgentRun.next_retry_at <= now),
+                    AgentRun.attempt_count < services.max_delivery_attempts,
                 )
             )
         )
@@ -48,6 +55,9 @@ def retry_confirmation_prompts(services: RuntimeServices) -> int:
             )
             for run in runs
         ]
+        for run in runs:
+            run.attempt_count += 1
+            run.next_retry_at = None
     attempted = 0
     for run_id, prompt, user_id in prompts:
         if prompt is None or user_id is None:
@@ -60,6 +70,7 @@ def retry_confirmation_prompts(services: RuntimeServices) -> int:
                 run_id,
                 success=False,
                 error=safe_external_error(exception),
+                provider_error_kind=ProviderErrorKind.AMBIGUOUS,
             )
         else:
             record_confirmation_delivery(
@@ -67,6 +78,11 @@ def retry_confirmation_prompts(services: RuntimeServices) -> int:
                 run_id,
                 success=delivery.success,
                 error=None if delivery.success else "QQ provider rejected delivery",
+                provider_error_kind=(
+                    None
+                    if delivery.success or delivery.provider_error is None
+                    else delivery.provider_error.kind
+                ),
             )
         attempted += 1
     return attempted

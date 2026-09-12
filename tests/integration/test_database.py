@@ -35,7 +35,7 @@ def test_migrations_pragmas_and_identity_bootstrap(
     url = f"sqlite:///{settings.database_path}"
     upgrade_database(root, url)
     upgrade_database(root, url)
-    assert current_revision(url) == "0007_phase6_reliability"
+    assert current_revision(url) == "0008_qq_reply_targets"
     assert database.pragmas() == {
         "foreign_keys": "1",
         "journal_mode": "wal",
@@ -133,7 +133,7 @@ def test_phase_six_migration_round_trip_preserves_run_timing(
     command.downgrade(migration_config(root, url), "0006_phase5_rag")
     assert current_revision(url) == "0006_phase5_rag"
     command.upgrade(migration_config(root, url), "head")
-    assert current_revision(url) == "0007_phase6_reliability"
+    assert current_revision(url) == "0008_qq_reply_targets"
     with database.engine.connect() as connection:
         run = connection.execute(
             text("SELECT started_at, attempt_count, next_retry_at FROM agent_runs WHERE id='run'")
@@ -170,3 +170,59 @@ def test_phase_six_migration_round_trip_preserves_run_timing(
             "state",
             "execution_started_at",
         )
+
+
+def test_qq_reply_target_migration_round_trip_preserves_event_identity(
+    database: Database, settings: AppSettings
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    url = f"sqlite:///{settings.database_path}"
+    upgrade_database(root, url)
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id, external_key, display_name, created_at, updated_at) "
+                "VALUES ('user', 'key', 'name', :now, :now)"
+            ),
+            {"now": "2026-01-01T00:00:00+00:00"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, session_type, summary, created_at, "
+                "last_active_at, updated_at) VALUES "
+                "('session', 'user', 'MAIN', '', :now, :now, :now)"
+            ),
+            {"now": "2026-01-01T00:00:00+00:00"},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, provider_event_id, created_at) "
+                "VALUES ('message', 'session', 'user', 'hello', 'event', :now)"
+            ),
+            {"now": "2026-01-01T00:00:00+00:00"},
+        )
+
+    command.downgrade(migration_config(root, url), "0007_phase6_reliability")
+    assert current_revision(url) == "0007_phase6_reliability"
+    command.upgrade(migration_config(root, url), "head")
+    assert current_revision(url) == "0008_qq_reply_targets"
+    with database.engine.begin() as connection:
+        columns = {
+            row[1] for row in connection.execute(text("PRAGMA table_info('conversation_messages')"))
+        }
+        assert {
+            "provider_name",
+            "provider_scope",
+            "provider_target_id",
+            "provider_message_id",
+            "provider_msg_seq",
+        } <= columns
+        row = connection.execute(
+            text(
+                "SELECT provider_event_id, provider_name, provider_scope, provider_target_id, "
+                "provider_message_id, provider_msg_seq "
+                "FROM conversation_messages WHERE id='message'"
+            )
+        ).one()
+        assert row == ("event", None, None, None, None, None)

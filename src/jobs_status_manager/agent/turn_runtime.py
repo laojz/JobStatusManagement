@@ -105,6 +105,7 @@ def _with_results(
             final_message_id=context.final_message_id,
             final_message_content=context.final_message_content,
             state=context.state,
+            reply_target=context.reply_target,
         ),
     )
 
@@ -166,7 +167,12 @@ def _deliver_confirmation_prompt(
     prompt: str,
 ) -> None:
     try:
-        delivery = services.qq.push(context.user_id, prompt)
+        target = context.reply_target or services.proactive_target
+        delivery = (
+            services.qq.push(context.user_id, prompt)
+            if target is None
+            else services.qq.deliver(target, prompt)
+        )
     except (RuntimeError, ValueError, TimeoutError) as exception:
         record_confirmation_delivery(
             services,
@@ -180,6 +186,11 @@ def _deliver_confirmation_prompt(
             context.run_id,
             success=delivery.success,
             error=None if delivery.success else "QQ provider rejected delivery",
+            provider_error_kind=(
+                None
+                if delivery.success or delivery.provider_error is None
+                else delivery.provider_error.kind
+            ),
         )
 
 

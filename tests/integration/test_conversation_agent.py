@@ -5,6 +5,7 @@ from pathlib import Path
 from time import sleep
 from uuid import UUID
 
+import pytest
 from pydantic import SecretStr
 from sqlalchemy import text
 from starlette.testclient import TestClient
@@ -12,15 +13,22 @@ from starlette.testclient import TestClient
 from jobs_status_manager.agent.contracts import (
     AgentRunState,
     ConversationResponse,
+    ProviderError,
+    ProviderErrorKind,
+    QQInboundEvent,
+    ReplyMode,
+    ReplyTarget,
     ToolCallRequest,
 )
 from jobs_status_manager.agent.runtime import (
     RuntimeServices,
+    _prepare_run_attempt,
     process_run,
     recover_runs,
     resume_confirmed_run,
 )
 from jobs_status_manager.agent.tools import TOOL_NAMES, WRITE_TOOL_NAMES, definitions
+from jobs_status_manager.agent.webhook import WebhookContext, _persist_event
 from jobs_status_manager.agent.write_contracts import ToolExecution
 from jobs_status_manager.agent.write_recovery import reconcile_terminal_actions
 from jobs_status_manager.agent.write_runtime import finalize_rejected_action
@@ -38,7 +46,11 @@ from jobs_status_manager.application_core.service import (
 )
 from jobs_status_manager.bootstrap.service import bootstrap_identity
 from jobs_status_manager.config.settings import AppSettings
-from jobs_status_manager.infrastructure.adapters.fakes import FakeLLM, FakeQQGateway
+from jobs_status_manager.infrastructure.adapters.fakes import (
+    FakeLLM,
+    FakeQQDeliveryResult,
+    FakeQQGateway,
+)
 from jobs_status_manager.infrastructure.clock import FakeClock
 from jobs_status_manager.infrastructure.database.connection import Database
 from jobs_status_manager.infrastructure.database.migrations import upgrade_database
@@ -66,6 +78,50 @@ def _webhook_settings(settings: AppSettings) -> AppSettings:
             "qq_user_openid": "openid-1",
         }
     )
+
+
+def _seed_runtime_run(
+    database: Database,
+    user_id: str,
+    now: str,
+    *,
+    provider_metadata: bool,
+) -> None:
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, session_type, summary, active_run_id, "
+                "created_at, last_active_at, updated_at) VALUES "
+                "('runtime-session', :user_id, 'MAIN', '', 'runtime-run', :now, :now, :now)"
+            ),
+            {"user_id": user_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, provider_event_id, provider_name, "
+                "provider_scope, provider_target_id, provider_message_id, provider_msg_seq, "
+                "created_at) VALUES ('runtime-message', 'runtime-session', 'user', 'hello', "
+                ":provider_event_id, :provider_name, :provider_scope, :provider_target_id, "
+                ":provider_message_id, :provider_msg_seq, :now)"
+            ),
+            {
+                "now": now,
+                "provider_event_id": "event" if provider_metadata else None,
+                "provider_name": "qq" if provider_metadata else None,
+                "provider_scope": "c2c" if provider_metadata else None,
+                "provider_target_id": "openid" if provider_metadata else None,
+                "provider_message_id": "message" if provider_metadata else None,
+                "provider_msg_seq": 4 if provider_metadata else None,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs (id, session_id, user_message_id, state, created_at) "
+                "VALUES ('runtime-run', 'runtime-session', 'runtime-message', 'RUNNING', :now)"
+            ),
+            {"now": now},
+        )
 
 
 def test_webhook_accepts_once_and_rejects_invalid_token(
@@ -107,6 +163,539 @@ def test_webhook_accepts_once_and_rejects_invalid_token(
         assert connection.execute(text("SELECT COUNT(*) FROM agent_runs")).scalar_one() == 1
 
 
+def test_baseline_answer_completion_persists_terminal_delivery_state(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    with database.engine.begin() as connection:
+        now = fake_clock.now().isoformat()
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, session_type, summary, active_run_id, "
+                "created_at, last_active_at, updated_at) VALUES "
+                "('baseline-session', :user_id, 'MAIN', '', 'baseline-run', :now, :now, :now)"
+            ),
+            {"user_id": user_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, provider_event_id, created_at) VALUES "
+                "('baseline-message', 'baseline-session', 'user', 'hello', 'baseline-event', :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs (id, session_id, user_message_id, state, created_at) "
+                "VALUES ('baseline-run', 'baseline-session', 'baseline-message', 'RUNNING', :now)"
+            ),
+            {"now": now},
+        )
+
+    process_run(
+        RuntimeServices(
+            database,
+            FakeLLM(conversation_responses=[ConversationResponse(answer="答复")]),
+            FakeQQGateway(),
+            fake_clock,
+            _ids(),
+        ),
+        "baseline-run",
+    )
+
+    with database.engine.connect() as connection:
+        state = connection.execute(text("SELECT state FROM agent_runs")).scalar_one()
+        delivery_state = connection.execute(
+            text("SELECT delivery_state FROM agent_runs")
+        ).scalar_one()
+    assert state == AgentRunState.COMPLETED.value
+    assert delivery_state == "SENT"
+
+
+def test_runtime_delivers_final_answer_to_persisted_passive_target(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=True)
+    qq = FakeQQGateway()
+
+    process_run(
+        RuntimeServices(
+            database,
+            FakeLLM(conversation_responses=[ConversationResponse(answer="答复")]),
+            qq,
+            fake_clock,
+            _ids(),
+        ),
+        "runtime-run",
+    )
+
+    assert qq.calls[0][0] == "deliver"
+    assert qq.calls[0][1][:7] == ("PASSIVE", "qq", "c2c", "openid", "message", "event", "4")
+    with database.engine.connect() as connection:
+        provider_message_id = connection.execute(
+            text("SELECT provider_message_id FROM agent_runs")
+        ).scalar_one()
+    assert provider_message_id == "fake-message"
+
+
+def test_runtime_uses_only_explicit_proactive_target_without_passive_metadata(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=False)
+    qq = FakeQQGateway()
+    proactive = ReplyTarget(ReplyMode.PROACTIVE, "qq", "c2c", "configured-openid")
+
+    process_run(
+        RuntimeServices(
+            database,
+            FakeLLM(conversation_responses=[ConversationResponse(answer="主动答复")]),
+            qq,
+            fake_clock,
+            _ids(),
+            proactive_target=proactive,
+        ),
+        "runtime-run",
+    )
+
+    assert qq.calls[0][0] == "deliver"
+    assert qq.calls[0][1][:7] == ("PROACTIVE", "qq", "c2c", "configured-openid", "", "", "")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (ProviderErrorKind.RETRYABLE, AgentRunState.DELIVERY_PENDING.value, "RETRY_WAIT"),
+        (ProviderErrorKind.PERMANENT, AgentRunState.FAILED.value, "FAILED"),
+        (ProviderErrorKind.AMBIGUOUS, AgentRunState.FAILED.value, "AMBIGUOUS"),
+    ],
+)
+def test_runtime_persists_provider_delivery_classification(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+    case: tuple[ProviderErrorKind, str, str],
+) -> None:
+    kind, run_state, delivery_state = case
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=True)
+    qq = FakeQQGateway(
+        delivery=FakeQQDeliveryResult(
+            success=False,
+            provider_message_id=None,
+            provider_error=ProviderError(kind=kind, provider_name="qq", code="test"),
+        )
+    )
+
+    process_run(
+        RuntimeServices(
+            database,
+            FakeLLM(conversation_responses=[ConversationResponse(answer="答复")]),
+            qq,
+            fake_clock,
+            _ids(),
+        ),
+        "runtime-run",
+    )
+
+    with database.engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT state, delivery_state, next_retry_at FROM agent_runs")
+        ).one()
+    assert row.state == run_state
+    assert row.delivery_state == delivery_state
+    assert (row.next_retry_at is not None) is (kind is ProviderErrorKind.RETRYABLE)
+
+
+def test_retryable_ordinary_delivery_keeps_session_claim_before_queued_run(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=False)
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, created_at) "
+                "VALUES ('queued-message', 'runtime-session', 'user', 'queued', :now)"
+            ),
+            {"now": fake_clock.now().isoformat()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs "
+                "(id, session_id, user_message_id, state, attempt_count, created_at) "
+                "VALUES ('queued-run', 'runtime-session', 'queued-message', 'QUEUED', 0, :now)"
+            ),
+            {"now": fake_clock.now().isoformat()},
+        )
+    qq = FakeQQGateway(
+        delivery=FakeQQDeliveryResult(
+            success=False,
+            provider_message_id=None,
+            provider_error=ProviderError(
+                kind=ProviderErrorKind.RETRYABLE,
+                provider_name="qq",
+                code="timeout",
+            ),
+        )
+    )
+
+    process_run(
+        RuntimeServices(
+            database,
+            FakeLLM(conversation_responses=[ConversationResponse(answer="答复")]),
+            qq,
+            fake_clock,
+            _ids(),
+        ),
+        "runtime-run",
+    )
+
+    with database.engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT sessions.active_run_id, current.state, current.delivery_state, "
+                "queued.state AS queued_state FROM sessions "
+                "JOIN agent_runs AS current ON current.id='runtime-run' "
+                "JOIN agent_runs AS queued ON queued.id='queued-run' "
+                "WHERE sessions.id='runtime-session'"
+            )
+        ).one()
+    assert rows.active_run_id == "runtime-run"
+    assert rows.state == AgentRunState.DELIVERY_PENDING.value
+    assert rows.delivery_state == "RETRY_WAIT"
+    assert rows.queued_state == AgentRunState.QUEUED.value
+
+
+def test_exception_based_ordinary_delivery_is_ambiguous_not_completed(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=False)
+
+    process_run(
+        RuntimeServices(
+            database,
+            FakeLLM(conversation_responses=[ConversationResponse(answer="答复")]),
+            FakeQQGateway(error=RuntimeError("provider unavailable")),
+            fake_clock,
+            _ids(),
+        ),
+        "runtime-run",
+    )
+
+    with database.engine.connect() as connection:
+        row = connection.execute(text("SELECT state, delivery_state FROM agent_runs")).one()
+    assert row.state == AgentRunState.FAILED.value
+    assert row.delivery_state == "AMBIGUOUS"
+
+
+def test_second_inbound_after_retryable_delivery_remains_queued(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=False)
+    qq = FakeQQGateway(
+        delivery=FakeQQDeliveryResult(
+            success=False,
+            provider_error=ProviderError(
+                kind=ProviderErrorKind.RETRYABLE,
+                provider_name="qq",
+                code="timeout",
+            ),
+        )
+    )
+
+    process_run(
+        RuntimeServices(
+            database,
+            FakeLLM(conversation_responses=[ConversationResponse(answer="答复")]),
+            qq,
+            fake_clock,
+            _ids(),
+        ),
+        "runtime-run",
+    )
+
+    webhook_settings = _webhook_settings(settings).model_copy(
+        update={"bootstrap_user_external_key": settings.bootstrap_user_external_key}
+    )
+    second_ids = DeterministicIdGenerator(
+        [UUID(f"00000000-0000-0000-0000-{index:012d}") for index in range(100, 120)]
+    )
+    response = _persist_event(
+        WebhookContext(database, webhook_settings, fake_clock, second_ids),
+        QQInboundEvent(
+            event_id="second-event",
+            user_openid="openid-1",
+            message_id="second-message",
+            event_type="C2C_MESSAGE_CREATE",
+            content="second inbound",
+        ),
+    )
+
+    assert response.status_code == 202
+    with database.engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT sessions.active_run_id, agent_runs.state "
+                "FROM sessions JOIN agent_runs ON agent_runs.id='runtime-run' "
+                "WHERE sessions.id='runtime-session'"
+            )
+        ).one()
+        queued_state = connection.execute(
+            text(
+                "SELECT state FROM agent_runs WHERE user_message_id = "
+                "(SELECT id FROM conversation_messages WHERE provider_event_id='second-event')"
+            )
+        ).scalar_one()
+    assert row.active_run_id == "runtime-run"
+    assert row.state == AgentRunState.DELIVERY_PENDING.value
+    assert queued_state == AgentRunState.QUEUED.value
+
+
+def test_exception_based_oserror_delivery_is_ambiguous_not_completed(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=False)
+
+    process_run(
+        RuntimeServices(
+            database,
+            FakeLLM(conversation_responses=[ConversationResponse(answer="答复")]),
+            FakeQQGateway(error=OSError("provider unavailable")),
+            fake_clock,
+            _ids(),
+        ),
+        "runtime-run",
+    )
+
+    with database.engine.connect() as connection:
+        row = connection.execute(text("SELECT state, delivery_state FROM agent_runs")).one()
+    assert row.state == AgentRunState.FAILED.value
+    assert row.delivery_state == "AMBIGUOUS"
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("future", 1, False, AgentRunState.DELIVERY_PENDING.value),
+        ("due", 1, True, AgentRunState.DELIVERY_PENDING.value),
+        ("due", 3, False, AgentRunState.FAILED.value),
+    ],
+)
+def test_sqlite_delivery_retry_preparation_handles_persisted_naive_times(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+    case: tuple[str, int, bool, str],
+) -> None:
+    retry_at, attempt_count, expected_claim, expected_state = case
+    user_id = _setup(database, settings, fake_clock)
+    now = fake_clock.now()
+    persisted_retry_at = (
+        now + timedelta(minutes=5) if retry_at == "future" else now - timedelta(minutes=1)
+    )
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, session_type, summary, active_run_id, "
+                "created_at, last_active_at, updated_at) VALUES "
+                "('retry-session', :user_id, 'MAIN', '', 'retry-run', :now, :now, :now)"
+            ),
+            {"user_id": user_id, "now": now.isoformat()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, created_at) VALUES "
+                "('retry-message', 'retry-session', 'user', 'retry', :now)"
+            ),
+            {"now": now.isoformat()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs "
+                "(id, session_id, user_message_id, state, attempt_count, next_retry_at, "
+                "created_at) "
+                "VALUES ('retry-run', 'retry-session', 'retry-message', 'DELIVERY_PENDING', "
+                ":attempt_count, :next_retry_at, :now)"
+            ),
+            {
+                "attempt_count": attempt_count,
+                "next_retry_at": persisted_retry_at.replace(tzinfo=None).isoformat(),
+                "now": now.isoformat(),
+            },
+        )
+
+    services = RuntimeServices(
+        database,
+        FakeLLM(),
+        FakeQQGateway(),
+        fake_clock,
+        _ids(),
+    )
+    claimed = _prepare_run_attempt(services, "retry-run")
+
+    assert claimed is expected_claim
+    with database.engine.connect() as connection:
+        row = connection.execute(
+            text("SELECT state, attempt_count, next_retry_at FROM agent_runs")
+        ).one()
+    assert row.state == expected_state
+    assert row.attempt_count == attempt_count + int(expected_claim)
+    assert (row.next_retry_at is None) is (
+        expected_claim or expected_state == AgentRunState.FAILED.value
+    )
+
+
+def test_sqlite_retry_exhaustion_releases_session_and_promotes_queued_successor(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    now = fake_clock.now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, session_type, summary, active_run_id, "
+                "created_at, last_active_at, updated_at) VALUES "
+                "('exhaust-session', :user_id, 'MAIN', '', 'exhaust-run', :now, :now, :now)"
+            ),
+            {"user_id": user_id, "now": now.isoformat()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, created_at) VALUES "
+                "('exhaust-message', 'exhaust-session', 'user', 'retry', :now), "
+                "('successor-message', 'exhaust-session', 'user', 'next', :now)"
+            ),
+            {"now": now.isoformat()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs "
+                "(id, session_id, user_message_id, state, attempt_count, next_retry_at, "
+                "created_at) "
+                "VALUES ('exhaust-run', 'exhaust-session', 'exhaust-message', "
+                "'DELIVERY_PENDING', 3, :now, :now), "
+                "('successor-run', 'exhaust-session', 'successor-message', 'QUEUED', 0, NULL, :now)"
+            ),
+            {"now": now.isoformat()},
+        )
+
+    services = RuntimeServices(
+        database,
+        FakeLLM(),
+        FakeQQGateway(),
+        fake_clock,
+        _ids(),
+    )
+    claimed = _prepare_run_attempt(services, "exhaust-run")
+
+    assert claimed is False
+    with database.engine.connect() as connection:
+        rows = connection.execute(
+            text("SELECT id, state, attempt_count FROM agent_runs ORDER BY created_at, id")
+        ).all()
+        active_run_id = connection.execute(
+            text("SELECT active_run_id FROM sessions WHERE id='exhaust-session'")
+        ).scalar_one()
+    assert rows[0].state == AgentRunState.FAILED.value
+    assert rows[1].state == AgentRunState.RUNNING.value
+    assert rows[1].attempt_count == 1
+    assert active_run_id == "successor-run"
+
+
+def test_command_delivery_retry_preserves_confirmation_claim_after_sqlite_restart(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    now = fake_clock.now()
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, session_type, summary, active_run_id, "
+                "created_at, last_active_at, updated_at) VALUES "
+                "('command-session', :user_id, 'MAIN', '', 'command-run', :now, :now, :now)"
+            ),
+            {"user_id": user_id, "now": now.isoformat()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, created_at) VALUES "
+                "('command-message', 'command-session', 'user', '确认 PA-ABCD', :now), "
+                "('command-answer', 'command-session', 'assistant', '已确认; 正在处理.', :now)"
+            ),
+            {"now": now.isoformat()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs "
+                "(id, session_id, user_message_id, final_message_id, state, delivery_state, "
+                "attempt_count, next_retry_at, created_at) VALUES "
+                "('command-run', 'command-session', 'command-message', 'command-answer', "
+                "'DELIVERY_PENDING', 'RETRY_WAIT', 1, :next_retry_at, :now)"
+            ),
+            {"next_retry_at": (now - timedelta(minutes=1)).isoformat(), "now": now.isoformat()},
+        )
+
+    database.dispose()
+    restarted_database = Database(settings.database_path)
+    qq = FakeQQGateway(
+        delivery=FakeQQDeliveryResult(
+            success=False,
+            provider_message_id=None,
+            provider_error=ProviderError(
+                kind=ProviderErrorKind.RETRYABLE,
+                provider_name="qq",
+                code="retry",
+            ),
+        )
+    )
+    try:
+        process_run(
+            RuntimeServices(restarted_database, FakeLLM(), qq, fake_clock, _ids()),
+            "command-run",
+        )
+
+        with restarted_database.engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT sessions.active_run_id, agent_runs.state, agent_runs.delivery_state "
+                    "FROM sessions JOIN agent_runs ON agent_runs.session_id = sessions.id"
+                )
+            ).one()
+    finally:
+        restarted_database.dispose()
+    assert row.active_run_id == "command-run"
+    assert row.state == AgentRunState.DELIVERY_PENDING.value
+    assert row.delivery_state == "RETRY_WAIT"
+
+
 def test_registry_exposes_phase_five_tools_with_confirmation_gated_writes() -> None:
     assert tuple(definition.name for definition in definitions()) == (
         *TOOL_NAMES,
@@ -138,8 +727,9 @@ def test_runtime_rejects_ninth_tool_and_forbidden_write(
         )
         connection.execute(
             text(
-                "INSERT INTO conversation_messages VALUES "
-                "('message', 'session', 'user', 'query', 'event', :now)"
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, provider_event_id, created_at) "
+                "VALUES ('message', 'session', 'user', 'query', 'event', :now)"
             ),
             {"now": fake_clock.now().isoformat()},
         )
@@ -1010,10 +1600,10 @@ def test_qq_delivery_failure_is_persisted(
     qq = FakeQQGateway(error=RuntimeError("provider unavailable"))
     process_run(RuntimeServices(database, llm, qq, fake_clock, ids), "run")
     with database.engine.connect() as connection:
-        assert connection.execute(text("SELECT state FROM agent_runs")).scalar_one() == "COMPLETED"
+        assert connection.execute(text("SELECT state FROM agent_runs")).scalar_one() == "FAILED"
         assert (
             connection.execute(text("SELECT delivery_state FROM agent_runs")).scalar_one()
-            == "FAILED"
+            == "AMBIGUOUS"
         )
         assert connection.execute(
             text("SELECT delivery_error FROM agent_runs")

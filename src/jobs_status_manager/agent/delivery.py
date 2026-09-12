@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
-from jobs_status_manager.agent.contracts import AgentRunState
+from jobs_status_manager.agent.contracts import AgentRunState, ProviderErrorKind
 from jobs_status_manager.agent.models import AgentRun, ConversationMessage
 from jobs_status_manager.agent.models import Session as AgentSession
 from jobs_status_manager.infrastructure.database.transactions import transaction
@@ -28,6 +29,7 @@ class DeliveryOutcome:
     state: str | None = None
     error: str | None = None
     provider_message_id: str | None = None
+    provider_error_kind: ProviderErrorKind | None = None
 
 
 def promote_next_run(session: Session, session_id: str, started_at: datetime) -> None:
@@ -86,10 +88,32 @@ def record_delivery(
         run = session.get(AgentRun, context.run_id)
         if run is None:
             return
-        run.delivery_state = delivery.state
+        delivery_state = delivery.state
+        retryable = (
+            delivery.provider_error_kind is ProviderErrorKind.RETRYABLE
+            and run.attempt_count < services.max_delivery_attempts
+        )
+        if retryable:
+            delivery_state = "RETRY_WAIT"
+        elif delivery.provider_error_kind is ProviderErrorKind.RETRYABLE:
+            delivery_state = "FAILED"
+        elif delivery.provider_error_kind is ProviderErrorKind.AMBIGUOUS:
+            delivery_state = "AMBIGUOUS"
+        run.delivery_state = delivery_state
         run.delivery_error = delivery.error
         run.provider_message_id = delivery.provider_message_id
+        if retryable:
+            run.state = AgentRunState.DELIVERY_PENDING.value
+            run.next_retry_at = services.clock.now() + timedelta(minutes=5)
+            return
         run.state = AgentRunState.COMPLETED.value
+        run.next_retry_at = None
+        if delivery_state != "SENT" or delivery.provider_error_kind in (
+            ProviderErrorKind.PERMANENT,
+            ProviderErrorKind.DEFINITE,
+            ProviderErrorKind.AMBIGUOUS,
+        ):
+            run.state = AgentRunState.FAILED.value
         session_row = session.get(AgentSession, context.session_id)
         if session_row is not None:
             session_row.active_run_id = None
@@ -107,23 +131,47 @@ def record_command_delivery(
         run = session.get(AgentRun, context.run_id)
         if run is None:
             return
-        message_id = str(services.ids.new_id())
-        session.add(
-            ConversationMessage(
-                id=message_id,
-                session_id=context.session_id,
-                role="assistant",
-                content=answer,
-                provider_event_id=None,
-                created_at=services.clock.now(),
+        message_id = run.final_message_id
+        if message_id is None:
+            message_id = str(services.ids.new_id())
+            session.add(
+                ConversationMessage(
+                    id=message_id,
+                    session_id=context.session_id,
+                    role="assistant",
+                    content=answer,
+                    provider_event_id=None,
+                    created_at=services.clock.now(),
+                )
             )
-        )
-        session.flush()
+            session.flush()
         run.final_message_id = message_id
-        run.delivery_state = delivery.state
+        delivery_state = delivery.state
+        if delivery.provider_error_kind is ProviderErrorKind.RETRYABLE:
+            delivery_state = "RETRY_WAIT"
+        elif delivery.provider_error_kind is ProviderErrorKind.AMBIGUOUS:
+            delivery_state = "AMBIGUOUS"
+        run.delivery_state = delivery_state
         run.delivery_error = delivery.error
         run.provider_message_id = delivery.provider_message_id
-        run.state = AgentRunState.COMPLETED.value
+        if (
+            delivery.provider_error_kind is ProviderErrorKind.RETRYABLE
+            and run.attempt_count < services.max_delivery_attempts
+        ):
+            run.state = AgentRunState.DELIVERY_PENDING.value
+            run.next_retry_at = services.clock.now() + timedelta(minutes=5)
+        else:
+            run.state = AgentRunState.COMPLETED.value
+            run.next_retry_at = None
+            if delivery.provider_error_kind in (
+                ProviderErrorKind.PERMANENT,
+                ProviderErrorKind.DEFINITE,
+                ProviderErrorKind.AMBIGUOUS,
+            ) or (
+                delivery.provider_error_kind is ProviderErrorKind.RETRYABLE
+                and run.attempt_count >= services.max_delivery_attempts
+            ):
+                run.state = AgentRunState.FAILED.value
         run.completed_at = services.clock.now()
 
 

@@ -46,7 +46,7 @@ Backup destinations must not be the live database or an existing file. The comma
 
 ## Knowledge index
 
-SQLite is the knowledge source of truth and Chroma is a rebuildable index. Only `ACTIVE` plus `READY` documents are searchable; `REMOVED` documents are excluded before cleanup. `KnowledgeChunk.id` is the Chroma record ID. Stop or quiesce the application before rebuilding so no worker concurrently changes the index. The command verifies the schema is at `0007_phase6_reliability (head)` and reports typed counts; partial document failures produce a nonzero exit.
+SQLite is the knowledge source of truth and Chroma is a rebuildable index. Only `ACTIVE` plus `READY` documents are searchable; `REMOVED` documents are excluded before cleanup. `KnowledgeChunk.id` is the Chroma record ID. Stop or quiesce the application before rebuilding so no worker concurrently changes the index. The command verifies the schema is at `0008_qq_reply_targets (head)` and reports typed counts; partial document failures produce a nonzero exit.
 
 ```bash
 uv run python -m jobs_status_manager rebuild-chroma
@@ -56,4 +56,4 @@ uv run python -m jobs_status_manager rebuild-chroma
 
 Startup scans stale Notification `SENDING`, Knowledge `INDEXING`, AgentRun `RUNNING`, and PendingAction `EXECUTING` before worker loops begin. Workers use AnyIO structured concurrency and database-driven scans. Shutdown cancels the task group and disposes the database after child tasks leave, so durable work remains retryable or becomes explicitly failed after a crash.
 
-The current database head is `0007_phase6_reliability`; health reports phase 6 and schema readiness without exposing business data. A real Bailian smoke completed with `text-embedding-v4` returning 1024 finite values. The key was loaded from the ignored `.env` file, and its value was not recorded. The follow-up rebuild and retrieval used isolated temporary paths, not production data, and reported `documents=1 ready=1 failed=0 chunks=1 upserted=1 partial_failure=False` with one matching document and a valid score. Temporary script and data were removed.
+The current database head is `0008_qq_reply_targets`; health reports phase 6 and schema readiness without exposing business data. A real Bailian smoke completed with `text-embedding-v4` returning 1024 finite values. The key was loaded from the ignored `.env` file, and its value was not recorded. The follow-up rebuild and retrieval used isolated temporary paths, not production data, and reported `documents=1 ready=1 failed=0 chunks=1 upserted=1 partial_failure=False` with one matching document and a valid score. Temporary script and data were removed.

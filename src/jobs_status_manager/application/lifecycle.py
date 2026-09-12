@@ -5,15 +5,18 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
 import anyio
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import exists, select, update
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
 from starlette.applications import Starlette
+from starlette.responses import Response
 from starlette.routing import Route
 
+from jobs_status_manager.agent.botpy_ingestion import create_botpy_event_handler
 from jobs_status_manager.agent.models import AgentRun
 from jobs_status_manager.agent.runtime import (
     RuntimeServices,
@@ -35,6 +38,7 @@ from jobs_status_manager.infrastructure.clock import SystemClock
 from jobs_status_manager.infrastructure.database.connection import Database
 from jobs_status_manager.infrastructure.ids import UUIDGenerator
 from jobs_status_manager.infrastructure.logging import configure_logging
+from jobs_status_manager.infrastructure.qq_botpy import create_botpy_runtime
 from jobs_status_manager.infrastructure.safe_errors import safe_external_error
 from jobs_status_manager.knowledge.index import (
     IndexRetryServices,
@@ -52,7 +56,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from starlette.requests import Request
-    from starlette.responses import Response
 
     from jobs_status_manager.config.settings import AppSettings
     from jobs_status_manager.infrastructure.adapters.protocols import (
@@ -64,6 +67,7 @@ if TYPE_CHECKING:
     )
     from jobs_status_manager.infrastructure.clock import Clock
     from jobs_status_manager.infrastructure.ids import IdGenerator
+    from jobs_status_manager.infrastructure.qq_botpy import LifespanBotpyRuntime
 
 
 logger = structlog.get_logger(__name__)
@@ -81,6 +85,52 @@ class LifecycleAdapters:
     ids: IdGenerator | None = None
     embedding: EmbeddingAdapter | None = None
     chroma: ChromaAdapter | None = None
+    qq_botpy_factory: Callable[[AppSettings], LifespanBotpyRuntime] | None = None
+
+
+class ClosableResource(Protocol):
+    """Synchronous resource that can be closed during lifespan teardown."""
+
+    def close(self) -> None:
+        """Release owned resource state."""
+
+
+class DisposableResource(Protocol):
+    """Synchronous resource that can dispose its pooled state."""
+
+    def dispose(self) -> None:
+        """Release pooled resource state."""
+
+
+async def _cleanup_lifecycle_resources(
+    qq_runtime: LifespanBotpyRuntime | None,
+    owned: ClosableResource | None,
+    database: DisposableResource,
+) -> None:
+    """Attempt every shutdown action even when cancellation or close errors occur."""
+    cleanup_error: BaseException | None = None
+    with anyio.CancelScope(shield=True):
+        if qq_runtime is not None:
+            try:
+                await qq_runtime.close()
+            except BaseException as error:
+                cleanup_error = error
+                logger.exception("qq_runtime_close_failed")
+        if owned is not None:
+            try:
+                owned.close()
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+                logger.exception("owned_adapter_close_failed")
+        try:
+            database.dispose()
+        except BaseException as error:
+            if cleanup_error is None:
+                cleanup_error = error
+            logger.exception("database_dispose_failed")
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def _recover_notifications(database: Database, adapters: LifecycleAdapters) -> None:
@@ -142,6 +192,7 @@ def _agent_cycle(database: Database, adapters: LifecycleAdapters, settings: AppS
         max_run_seconds=settings.agent_max_run_seconds,
         tool_timeout_seconds=settings.agent_tool_timeout_seconds,
         max_result_chars=settings.agent_max_result_chars,
+        max_delivery_attempts=settings.agent_max_delivery_attempts,
     )
     for result in recovered_actions:
         resume_confirmed_run(services, result.action_id)
@@ -151,14 +202,36 @@ def _agent_cycle(database: Database, adapters: LifecycleAdapters, settings: AppS
     with database.engine.begin() as connection:
         run_id = connection.execute(
             select(AgentRun.id)
-            .where(AgentRun.state.in_(("RUNNING", "DELIVERY_PENDING")))
+            .where(
+                (AgentRun.state == "RUNNING")
+                | (
+                    (AgentRun.state == "DELIVERY_PENDING")
+                    & (AgentRun.next_retry_at.is_(None) | (AgentRun.next_retry_at <= clock.now()))
+                )
+            )
             .order_by(AgentRun.created_at)
             .limit(1)
         ).scalar_one_or_none()
         if run_id is None:
+            active_run = aliased(AgentRun)
             queued_id = connection.execute(
                 select(AgentRun.id)
-                .where(AgentRun.state == "QUEUED")
+                .where(
+                    AgentRun.state == "QUEUED",
+                    ~exists(
+                        select(active_run.id).where(
+                            active_run.session_id == AgentRun.session_id,
+                            active_run.state.in_(
+                                (
+                                    "RUNNING",
+                                    "QUEUED",
+                                    "DELIVERY_PENDING",
+                                    "WAITING_USER_CONFIRMATION",
+                                )
+                            ),
+                        )
+                    ),
+                )
                 .order_by(AgentRun.created_at)
                 .limit(1)
             ).scalar_one_or_none()
@@ -223,8 +296,20 @@ def create_app(
     """Create the Starlette application with explicit Phase 2 worker wiring."""
     supplied_adapters = adapters if adapters is not None else LifecycleAdapters()
     effective_adapters = supplied_adapters
+    qq_runtime: LifespanBotpyRuntime | None = None
 
     async def qq_webhook(request: Request) -> Response:
+        if qq_runtime is not None:
+            transport_response = await qq_runtime.handle_http_request(
+                await request.body(),
+                dict(request.headers),
+            )
+            return Response(
+                transport_response.body,
+                status_code=transport_response.status,
+                headers=dict(transport_response.headers),
+                media_type="application/json",
+            )
         return await receive_webhook(
             request,
             WebhookContext(
@@ -238,11 +323,32 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncIterator[ApplicationState]:
-        nonlocal effective_adapters
+        nonlocal effective_adapters, qq_runtime
         configure_logging(settings.log_level)
         database = Database(settings.database_path)
         owned = None
         try:
+            if supplied_adapters.qq is None and supplied_adapters.qq_botpy_factory is not None:
+                qq_runtime = supplied_adapters.qq_botpy_factory(settings)
+            elif (
+                supplied_adapters.qq is None
+                and settings.qq_enabled
+                and settings.qq_app_id is not None
+                and settings.qq_app_secret is not None
+                and settings.qq_token_base_url is not None
+            ):
+                qq_context = WebhookContext(
+                    database,
+                    settings,
+                    supplied_adapters.clock
+                    if supplied_adapters.clock is not None
+                    else SystemClock(),
+                    supplied_adapters.ids if supplied_adapters.ids is not None else UUIDGenerator(),
+                )
+                qq_runtime = create_botpy_runtime(
+                    settings,
+                    create_botpy_event_handler(qq_context),
+                )
             owned = (
                 None
                 if supplied_adapters.embedding is not None and supplied_adapters.chroma is not None
@@ -251,7 +357,11 @@ def create_app(
             effective_adapters = LifecycleAdapters(
                 imap=supplied_adapters.imap,
                 llm=supplied_adapters.llm,
-                qq=supplied_adapters.qq,
+                qq=(
+                    supplied_adapters.qq
+                    if supplied_adapters.qq is not None
+                    else (qq_runtime.gateway if qq_runtime is not None else None)
+                ),
                 clock=supplied_adapters.clock,
                 ids=supplied_adapters.ids,
                 embedding=(
@@ -267,6 +377,8 @@ def create_app(
             )
             _startup_recovery(database, effective_adapters, settings)
             async with anyio.create_task_group() as task_group:
+                if qq_runtime is not None:
+                    await qq_runtime.start(task_group)
                 task_group.start_soon(
                     _worker_loop,
                     "imap-poller",
@@ -300,12 +412,12 @@ def create_app(
                 yield {"database": database, "project_root": project_root}
                 task_group.cancel_scope.cancel()
         finally:
-            if owned is not None:
-                owned.close()
-            database.dispose()
+            runtime_to_close = qq_runtime
+            qq_runtime = None
+            await _cleanup_lifecycle_resources(runtime_to_close, owned, database)
 
     routes = [
         Route("/health", health, methods=["GET"]),
-        Route("/webhooks/qq", qq_webhook, methods=["POST"]),
+        Route(settings.qq_webhook_path, qq_webhook, methods=["POST"]),
     ]
     return Starlette(routes=routes, lifespan=lifespan)

@@ -5,7 +5,9 @@ from typing import Protocol
 from jobs_status_manager.agent.contracts import (
     ConversationPrompt,
     ConversationResponse,
+    ProviderError,
     QQInboundEvent,
+    ReplyTarget,
 )
 from jobs_status_manager.knowledge.contracts import VectorHit, VectorRecord
 from jobs_status_manager.mail import JobMailAnalysisInput, MailEnvelope
@@ -40,6 +42,11 @@ class QQDeliveryResult(Protocol):
         """Provider trace identifier."""
         ...
 
+    @property
+    def provider_error(self) -> ProviderError | None:
+        """Classified provider failure, when one was returned."""
+        ...
+
 
 class QQGateway(Protocol):
     """QQ outbound push boundary."""
@@ -58,6 +65,26 @@ class QQGateway(Protocol):
 
     def reply(self, user_id: str, message_id: str, content: str) -> QQDeliveryResult:
         """Reply to the current inbound message."""
+        ...
+
+    def deliver(self, target: ReplyTarget, content: str) -> QQDeliveryResult:
+        """Deliver content using the target's explicit passive or proactive mode."""
+        ...
+
+    def send_file(
+        self,
+        target: ReplyTarget,
+        filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> QQDeliveryResult:
+        """Describe a file delivery operation without selecting a provider SDK."""
+        ...
+
+    def send_image(
+        self, target: ReplyTarget, content_type: str, content: bytes
+    ) -> QQDeliveryResult:
+        """Describe an image delivery operation without selecting a provider SDK."""
         ...
 
 

@@ -11,6 +11,7 @@ dependencies = [
     "pydantic-settings>=2.7,<3",
     "pypdf>=6,<7",
     "python-docx>=1.2,<2",
+    "qq-botpy-sdk==2.0.4",
     "sqlalchemy>=2.0,<3",
     "starlette>=0.41,<1",
     "structlog>=24.4,<26",

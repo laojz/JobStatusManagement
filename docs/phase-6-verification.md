@@ -2,6 +2,13 @@
 
 Credential-free evidence from the repository verification remains preserved below. A real Bailian provider smoke and isolated temporary-path CLI verification were also completed on 2026-09-11. The API key was loaded from the ignored `.env` file; its value and all sensitive provider data were excluded from this record. No production indexing path or production data was used.
 
+The table below is the historical Phase 6 verification snapshot: its database
+head was `0007_phase6_reliability` at the time of that verification, and its
+results are intentionally preserved unchanged. After the Todo 4 QQ adapter
+work, the current repository database head is `0008_qq_reply_targets`; that
+new head and its restart-safe reply-target reconstruction are verified in the
+separate Todo 4 evidence record.
+
 | Command | Result |
 | --- | --- |
 | `uv run pytest -q` | PASS: 120 tests passed (118 before the real LocalChroma and CLI cleanup regression tests were added) |
@@ -10,10 +17,11 @@ Credential-free evidence from the repository verification remains preserved belo
 | `uv run basedpyright` | PASS: 0 errors, 0 warnings, 0 notes |
 | changed Python file LSP diagnostics | PASS: no diagnostics |
 | `uv run alembic check` | PASS: No new upgrade operations detected |
-| `uv run alembic current` | PASS: `0007_phase6_reliability (head)` |
+| `uv run alembic current` | PASS (historical Phase 6): `0007_phase6_reliability (head)` |
 | `git diff --check` | PASS |
 | `uv run python -m jobs_status_manager --help` | PASS: all 12 command names preserved |
-| credential-free temp-path `migrate` / `bootstrap` / `health` | PASS: migrated, created identity, `ready phase=6 schema_version=0007_phase6_reliability` |
+| credential-free temp-path `migrate` / `bootstrap` / `health` | PASS (historical Phase 6): migrated, created identity, `ready phase=6 schema_version=0007_phase6_reliability` |
+| current repository head after Todo 4 adapter work | `0008_qq_reply_targets (head)`; verified separately without changing the historical results above |
 | targeted lifecycle/CLI/RAG tests | PASS: focused adapter, lifecycle, settings, knowledge, health, and CLI tests; full suite 120 tests |
 | real LocalChroma temporary-path integration | PASS: `rebuild_index` and search with deterministic `FakeEmbedding` and isolated SQLite |
 | real Bailian embedding smoke | PASS: provider `bailian`, model `text-embedding-v4`, dimensions `1024`, finite values `true` |

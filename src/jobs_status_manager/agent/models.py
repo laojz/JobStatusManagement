@@ -47,6 +47,11 @@ class ConversationMessage(Base):
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     provider_event_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_scope: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    provider_target_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_message_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_msg_seq: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

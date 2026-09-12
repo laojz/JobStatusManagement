@@ -13,6 +13,8 @@ from jobs_status_manager.agent.contracts import (
     AgentRunState,
     PromptMessage,
     PromptToolResult,
+    ReplyMode,
+    ReplyTarget,
 )
 from jobs_status_manager.agent.models import AgentRun, ConversationMessage, ToolCall, ToolResult
 from jobs_status_manager.agent.models import Session as AgentSession
@@ -59,6 +61,7 @@ class RunContext:
     final_message_id: str | None
     final_message_content: str | None
     state: str
+    reply_target: ReplyTarget | None = None
 
 
 def load_context(database: Database, run_id: str) -> RunContext | None:
@@ -123,6 +126,23 @@ def load_context(database: Database, run_id: str) -> RunContext | None:
             if run.final_message_id is not None
             else None
         )
+        reply_target = None
+        if (
+            message.provider_name is not None
+            and message.provider_scope is not None
+            and message.provider_target_id is not None
+            and message.provider_message_id is not None
+            and message.provider_event_id is not None
+        ):
+            reply_target = ReplyTarget(
+                mode=ReplyMode.PASSIVE,
+                provider_name=message.provider_name,
+                provider_scope=message.provider_scope,
+                target_id=message.provider_target_id,
+                message_id=message.provider_message_id,
+                event_id=message.provider_event_id,
+                msg_seq=message.provider_msg_seq,
+            )
         return RunContext(
             run_id=run_id,
             session_id=run.session_id,
@@ -142,6 +162,7 @@ def load_context(database: Database, run_id: str) -> RunContext | None:
             final_message_id=run.final_message_id,
             final_message_content=None if final_message is None else final_message.content,
             state=run.state,
+            reply_target=reply_target,
         )
 
 
@@ -177,4 +198,5 @@ def update_active_context(database: Database, context: RunContext) -> RunContext
             final_message_id=context.final_message_id,
             final_message_content=context.final_message_content,
             state=context.state,
+            reply_target=context.reply_target,
         )

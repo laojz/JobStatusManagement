@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
+from jobs_status_manager.agent.contracts import ProviderError, ProviderErrorKind
 from jobs_status_manager.application_core.domain import ApplicationStatus, UserId
 from jobs_status_manager.application_core.models import OutboxEvent
 from jobs_status_manager.application_core.service import execute_status_update, resolve_confirmation
@@ -192,6 +193,24 @@ def test_ordinary_job_mail_reaches_qq_once(
         assert connection.execute(text("SELECT state FROM notifications")).scalar_one() == "SENT"
         assert connection.execute(text("SELECT COUNT(*) FROM pending_actions")).scalar_one() == 0
         assert connection.execute(text("SELECT COUNT(*) FROM job_events")).scalar_one() == 0
+
+
+def test_notification_success_claim_is_idempotent(
+    database: Database, settings: AppSettings, fake_clock: FakeClock
+) -> None:
+    setup = _setup(database, settings, fake_clock)
+    _poll(setup, _envelope("m-duplicate-claim", "application received", "你的申请已收到"))
+    events = EventServices(setup.services, FakeLLM(analysis=_analysis(should_update=False)))
+    publish_once(events)
+    publish_once(events)
+    notifications = NotificationServices(database, fake_clock, setup.services.ids)
+    gateway = FakeQQGateway()
+
+    assert dispatch_once(notifications, gateway) == 1
+    assert dispatch_once(notifications, gateway) == 0
+    assert gateway.calls == [
+        ("push", (setup.identity.user_id, "求职邮件: 腾讯 / 后端开发\n面试安排信息"))
+    ]
 
 
 def test_status_mail_creates_inert_action_and_confirmation(
@@ -410,6 +429,46 @@ def test_notification_attempt_failure_error_is_bounded_and_safe(
         assert len(attempt.error) <= 2000
         assert "secret" not in attempt.error
         assert "private" not in attempt.error
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        (ProviderErrorKind.RETRYABLE, "RETRY_WAIT", True),
+        (ProviderErrorKind.PERMANENT, "FAILED", False),
+        (ProviderErrorKind.AMBIGUOUS, "FAILED", False),
+    ],
+)
+def test_notification_provider_classification_controls_retry(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+    case: tuple[ProviderErrorKind, str, bool],
+) -> None:
+    setup = _setup(database, settings, fake_clock)
+    _poll(setup, _envelope("m-classified", "application received", "申请已收到"))
+    events = EventServices(setup.services, FakeLLM(analysis=_analysis(should_update=False)))
+    publish_once(events)
+    publish_once(events)
+    gateway = FakeQQGateway(
+        delivery=FakeQQDeliveryResult(
+            success=False,
+            provider_message_id=None,
+            provider_error=ProviderError(kind=case[0], provider_name="qq", code="test"),
+        )
+    )
+    notifications = NotificationServices(database, fake_clock, setup.services.ids)
+
+    assert dispatch_once(notifications, gateway) == 1
+    with database.engine.connect() as connection:
+        state = connection.execute(text("SELECT state FROM notifications")).scalar_one()
+        attempt_result = connection.execute(
+            text("SELECT result FROM notification_attempts")
+        ).scalar_one()
+    assert state == case[1]
+    assert attempt_result == (case[0].value if case[0] is not None else "FAILED")
+    if not case[2]:
+        assert dispatch_once(notifications, gateway) == 0
 
 
 def test_processed_event_unique_constraint_rejects_duplicate_marker(

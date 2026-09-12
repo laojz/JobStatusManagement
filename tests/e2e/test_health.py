@@ -21,7 +21,7 @@ def test_health_startup_and_shutdown(settings: AppSettings) -> None:
             "status": "ready",
             "phase": "6",
             "database": "ok",
-            "schema_version": "0007_phase6_reliability",
+            "schema_version": "0008_qq_reply_targets",
             "readiness": "ready",
             "durable_tasks": "ok",
             "failed_tasks": 0,

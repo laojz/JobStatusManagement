@@ -86,6 +86,8 @@ def _persist_event(
     *,
     command_run: bool = False,
 ) -> Response:
+    if _has_identity(context, event):
+        return JSONResponse({"status": "duplicate"}, status_code=200)
     upload = prepare_upload(context.settings, context.ids, event)
     persisted = False
     try:
@@ -136,6 +138,11 @@ def _persist_event(
                 role="user",
                 content=event.content,
                 provider_event_id=event.event_id,
+                provider_name="qq",
+                provider_scope="c2c",
+                provider_target_id=event.user_openid,
+                provider_message_id=event.message_id,
+                provider_msg_seq=event.msg_seq,
                 created_at=now,
             )
             session.add(message)
@@ -181,6 +188,7 @@ def _persist_event(
                             (
                                 AgentRunState.RUNNING.value,
                                 AgentRunState.QUEUED.value,
+                                AgentRunState.DELIVERY_PENDING.value,
                                 AgentRunState.WAITING_USER_CONFIRMATION.value,
                             )
                         ),
@@ -212,7 +220,9 @@ def _persist_event(
             session_row.updated_at = now
         persisted = True
     except IntegrityError:
-        return JSONResponse({"status": "duplicate"}, status_code=200)
+        if _has_identity(context, event):
+            return JSONResponse({"status": "duplicate"}, status_code=200)
+        raise
     finally:
         if upload is not None and not persisted:
             discard_upload(upload)
@@ -237,6 +247,25 @@ async def receive_webhook(
         )
     except (UnsupportedUploadError, binascii.Error):
         return _response(400, "invalid file upload")
+
+
+def _has_identity(context: WebhookContext, event: QQInboundEvent) -> bool:
+    with transaction(context.database) as session:
+        return (
+            session.scalar(
+                select(QQInboundIdentity).where(
+                    and_(
+                        QQInboundIdentity.identity_type == "event",
+                        QQInboundIdentity.identity_value == event.event_id,
+                    )
+                    | and_(
+                        QQInboundIdentity.identity_type == "message",
+                        QQInboundIdentity.identity_value == event.message_id,
+                    )
+                )
+            )
+            is not None
+        )
 
 
 def _response(status_code: int, error: str) -> JSONResponse:

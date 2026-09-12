@@ -1,6 +1,51 @@
 # Deployment
 
-Run one process for one user, mailbox, and QQ account. SQLite WAL, local Chroma, uploads, and the database are local durable state. Do not run a second process against the same database.
+Run exactly one process for one user, mailbox, and QQ account. SQLite WAL, local
+Chroma, uploads, and the database are local durable state. Do not run a second
+process against the same database, and do not start a second server for QQ.
+Starlette owns the only listener, including `POST /webhooks/qq`; botpy is an
+in-process client and transport, not another HTTP service.
+
+## Configuration and credential gates
+
+The `.env.example` file is safe and credential-free. These settings control the
+single-process runtime:
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `APP_DATABASE_PATH` | yes | SQLite database path |
+| `APP_DATA_DIR` | yes | private uploads and application data directory |
+| `APP_HOST` / `APP_PORT` | yes | the one Starlette listener; default `127.0.0.1:8000` |
+| `APP_QQ_USER_OPENID` | yes | configured single-user QQ binding |
+| `APP_QQ_ENABLED` | no | explicit production botpy gate; default `false` |
+| `APP_QQ_APP_ID` | no | botpy production credential pair, only with `APP_QQ_APP_SECRET` |
+| `APP_QQ_APP_SECRET` | no | secret half of the botpy production credential pair |
+| `APP_QQ_API_BASE_URL` | yes | current QQ API base, default `https://api.bot.qq.com` |
+| `APP_QQ_TOKEN_BASE_URL` | conditional | explicit operator-verified QQ token base required when QQ credentials are enabled |
+| `APP_QQ_WEBHOOK_PATH` | yes | Starlette webhook route path; default `/webhooks/qq` |
+| `APP_QQ_WEBHOOK_TOKEN` | no | local/test webhook token when using the fake gateway |
+| `APP_QQ_REQUEST_TIMEOUT_SECONDS` | yes | bounded SDK request timeout |
+| `APP_QQ_DISPATCH_TIMESTAMP_MAX_AGE_SECONDS` | yes | maximum accepted dispatch signature age in either direction; `1..3600`, default `300` |
+| `APP_QQ_DOWNLOAD_TIMEOUT_SECONDS` / `APP_QQ_DOWNLOAD_DEADLINE_SECONDS` | yes | bounded inbound attachment time limits |
+| `APP_QQ_MAX_DOWNLOAD_BYTES` | yes | inbound attachment size limit |
+| `APP_LLM_API_KEY` | no | optional LLM integration credential |
+| `APP_EMBEDDING_API_KEY` + `APP_CHROMA_PATH` | pair | optional production indexing; configure both or neither |
+
+QQ production registration requires explicit `APP_QQ_ENABLED=true` and complete
+credentials. With the gate false, even complete credentials remain in no-QQ
+mode and botpy is not constructed. With the gate true and neither
+`APP_QQ_APP_ID` nor `APP_QQ_APP_SECRET`, the runtime remains in no-QQ mode and
+does not instantiate botpy. With both, the Starlette lifespan creates exactly
+one botpy `Client`, one custom transport, and one gateway, then injects that
+gateway into notification and agent workers. Supplying `LifecycleAdapters.qq`
+is authoritative and prevents any automatic or injected botpy runtime from
+being created. Supplying only one production credential fails settings loading
+with a safe field-level configuration error; no secret value is included.
+Complete QQ credentials without `APP_QQ_TOKEN_BASE_URL` also fail before
+startup. Both QQ API and token URLs must use HTTPS. `https://bots.qq.com` is retained only as an explicitly supplied,
+unverified SDK-era compatibility fallback; it is never a production default.
+
+## Startup, readiness, and shutdown
 
 ```bash
 uv sync
@@ -24,4 +69,113 @@ uv run python -m jobs_status_manager restore-check ./backups/jobs-YYYYMMDD-HHMMS
 uv run python -m jobs_status_manager integrity-check
 ```
 
-Startup scans stale Notification `SENDING`, PendingAction `EXECUTING`, AgentRun `RUNNING`, and Knowledge `INDEXING` before worker loops. AnyIO structured shutdown leaves durable windows retryable or explicitly failed. Delivery is at-least-once; exactly-once is not claimed. Configure `APP_EMBEDDING_API_KEY` and `APP_CHROMA_PATH` together for Bailian embeddings and local Chroma. Stop or quiesce the runtime before `rebuild-chroma`.
+`GET /health` is the readiness check. It returns HTTP 200 only after the
+database connection and migration head are available; HTTP 503 means the
+process is not ready. It does not prove QQ credentials or external endpoint
+reachability. The application starts worker tasks only after startup recovery
+and botpy transport readiness. On shutdown, worker tasks are cancelled first,
+then the lifecycle closes the botpy client, closes the Starlette transport, and
+disposes the database. Each owned resource is closed once.
+
+Startup scans stale Notification `SENDING`, PendingAction `EXECUTING`, AgentRun
+`RUNNING`, and Knowledge `INDEXING` before worker loops. AnyIO structured
+shutdown leaves durable windows retryable or explicitly failed. Delivery is
+at-least-once; exactly-once is not claimed. Configure
+`APP_EMBEDDING_API_KEY` and `APP_CHROMA_PATH` together for Bailian embeddings
+and local Chroma. Stop or quiesce the runtime before `rebuild-chroma`.
+
+## Safe local smoke
+
+These commands make no QQ request and do not require secrets. The effective
+listener bind is `APP_HOST`/`APP_PORT`; `APP_QQ_WEBHOOK_PATH` controls only the
+Starlette route path.
+
+```bash
+cp .env.example .env
+chmod 600 .env
+uv run python -m jobs_status_manager migrate
+uv run python -m jobs_status_manager bootstrap
+uv run python -m jobs_status_manager demo-mail-pipeline
+uv run python -m jobs_status_manager health
+uv run pytest -q tests/unit/test_settings.py tests/unit/test_factory.py tests/integration/test_qq_webhook.py tests/e2e/test_health.py
+```
+
+Do not set only one of `APP_QQ_APP_ID` and `APP_QQ_APP_SECRET` while testing a
+local process. To exercise that failure without a secret, construct settings
+with one placeholder and confirm the safe `must be configured together`
+configuration error in `tests/unit/test_settings.py`.
+
+## Human-gated live QQ boundary
+
+Live validation is not part of local CI and was not run by this change. Every
+step below is `BLOCKED` until a human operator explicitly approves a
+non-destructive smoke window, supplies credentials through an ignored
+environment file or secret manager, approves the exact recipient and endpoint
+values, and approves rollback and cleanup. Never store secrets, signatures,
+complete openids, provider payloads, attachment contents, or URL query values
+in logs or evidence.
+
+Before startup, the operator must approve the test account, exactly one test
+recipient, non-sensitive test messages/files, expected side effects, stop
+conditions, credential injection method, and cleanup plan. Use one process,
+one database, one Starlette listener, one botpy client, and one custom
+transport. Do not start botpy's own HTTP server or a second listener.
+
+Only after those approvals are recorded outside the evidence file may the
+operator inject values such as:
+
+```bash
+export APP_QQ_APP_ID='<provided-by-operator>'
+export APP_QQ_APP_SECRET='<provided-by-operator>'
+export APP_QQ_USER_OPENID='<approved-test-recipient>'
+export APP_QQ_API_BASE_URL='https://api.bot.qq.com'
+export APP_QQ_TOKEN_BASE_URL='<operator-verified-token-endpoint>'
+uv run python -m jobs_status_manager run
+curl --fail http://127.0.0.1:8000/health
+```
+
+### Ordered live checklist
+
+1. Confirm the API endpoint and Token endpoint are current, operator-verified,
+   and explicitly authorized. Record hostnames only; do not assume SDK defaults
+   or silently use `https://bots.qq.com`.
+2. Run `migrate`, `bootstrap`, and `health`; confirm readiness before any QQ
+   event. Configuration output must not contain secrets.
+3. Verify API access, token acquisition, and token refresh using the authorized
+   endpoints. Record HTTP status, QQ `err_code`, and redacted trace/provider
+   IDs only.
+4. Send the signed URL challenge (`op=13`) to `POST /webhooks/qq`; confirm the
+   challenge response and mark `PASS`, `FAIL`, or `BLOCKED`.
+5. Receive one non-destructive C2C text event; confirm persistence precedes the
+   ordinary ACK and record only redacted event/message IDs.
+6. Re-deliver that exact event; confirm duplicate handling creates no second
+   message, run, or file.
+7. Exercise one passive text reply using the persisted openid, message ID,
+   event ID, and sequence where available; confirm the approved recipient and
+   record only status/provider ID.
+8. Exercise one proactive C2C push to the approved recipient without
+   passive-only fields; record only status/provider ID.
+9. Receive one bounded, non-sensitive attachment through the URL metadata
+   path; confirm validation, storage, and cleanup without recording the URL,
+   query, token, or file contents.
+10. Send one ordinary file and, only if separately approved, one image using a
+    non-sensitive fixture. Mark capability `PASS`, `FAIL`, or `BLOCKED` from
+    the provider result; SDK method presence is not proof of support.
+11. Exercise one approved ambiguous proactive outcome, such as a timeout or
+    connection interruption. Confirm it is recorded as ambiguous and is not
+    blindly retried or duplicated. Stop if delivery or recipient is unclear.
+12. Stop with Ctrl-C or SIGTERM, confirm client/transport/task shutdown, then
+    restart once with the same database and verify durable recovery/readiness
+    without duplicating prior events or sends.
+13. Remove approved test messages/files, temporary uploads, logs, and test
+    database artifacts. Confirm no credentials, `.part` files, listeners, or
+    provider payloads remain.
+
+Record each step as `PASS`, `FAIL`, `BLOCKED`, or `NOT_RUN` with timestamp,
+code/SDK version, authorized endpoint hostnames, HTTP status, QQ `err_code`,
+redacted correlation/provider IDs, observed side effects, and cleanup result.
+Immediately stop and mark remaining steps `BLOCKED` for an unexpected
+recipient, unexpected endpoint, credential leak, unsafe file response,
+ambiguous side effect, or failed cleanup. Ordinary-file support and endpoint
+compatibility remain unclaimed until this human session is completed and
+reviewed.

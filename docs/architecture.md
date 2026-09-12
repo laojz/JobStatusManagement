@@ -1054,6 +1054,137 @@ QQGateway
 
 ---
 
+## 25.1 botpy 2.0.4 具体适配器基线
+
+v1 使用 `qq-botpy-sdk==2.0.4` 作为 QQ Gateway 的 SDK 实现，但 SDK
+只属于基础设施适配层，不改变前文的 `QQGateway` 业务抽象。当前实现是
+单用户、单邮箱账户、单 QQ 账号、单进程部署，不宣称多用户或多账号路由。
+
+### 配置与构造门控
+
+真实 botpy runtime 只有在以下条件同时满足时才构造：
+
+```text
+APP_QQ_ENABLED=true
+APP_QQ_APP_ID 已设置
+APP_QQ_APP_SECRET 已设置
+APP_QQ_TOKEN_BASE_URL 已显式设置
+APP_QQ_API_BASE_URL 使用 HTTPS
+APP_QQ_TOKEN_BASE_URL 使用 HTTPS
+```
+
+`APP_QQ_APP_ID` 与 `APP_QQ_APP_SECRET` 必须成对出现。关闭门控或缺少完整
+配置时，运行时保持 no-QQ / `FakeQQGateway` 路径；只提供部分凭据时，配置
+加载安全失败且不得输出 Secret 值。
+
+`APP_QQ_API_BASE_URL` 当前生产配置使用 `https://api.bot.qq.com`。Token
+基础 URL 必须由部署操作者显式确认，不能从 SDK 默认值或未经验证的旧域名
+推断。`https://bots.qq.com` 只允许作为操作者明确选择的兼容 fallback，
+不是生产默认值。
+
+### 生命周期与监听器所有权
+
+```text
+Starlette lifespan
+ ├─ one botpy Client
+ ├─ one custom EventTransport
+ └─ one BotpyQQGateway
+```
+
+Starlette 继续独占 `POST /webhooks/qq` 和唯一 HTTP listener。适配器不启动
+botpy 内置 Webhook Server，不启动第二个应用进程，不切换 WebSocket/Gateway
+模式。启动时由 lifespan 创建资源，关闭时按受控 dispatch task、botpy
+Client、异步桥和外部资源的顺序释放，并保证 close 幂等。
+
+### Webhook、验签与 ACK
+
+```text
+原始 body + 签名 headers
+          ↓
+Custom EventTransport
+          ↓
+校验 / 解析 / sender binding
+          ↓
+SQLite 持久化 ConversationMessage、附件元数据和 AgentRun
+          ↓ commit
+HTTP 200 {"op": 12, "d": 0}
+          ↓
+后台执行 Command Router / Conversation Agent
+```
+
+`op=13` URL 验证单独处理，不创建 AgentRun；普通 `op=0` 事件只有在持久化
+receipt 成功后才返回 accepted ACK。重复事件按事件或消息身份幂等处理，
+不会重复创建消息、文件或 AgentRun。JSON/事件格式错误、验签失败、sender
+不匹配和持久化失败不返回 accepted ACK，使 QQ 可以按协议重投。ACK 之后的
+Agent、LLM、Tool Calling、Embedding 和 Chroma 工作不属于 ACK 前置条件。
+
+### C2C reply、push 与目标持久化
+
+适配器只承诺 QQ C2C：
+
+```text
+passive target = user_openid + message_id + event_id + msg_seq?
+proactive target = user_openid
+```
+
+入站事件持久化 `provider`、`user_openid`、provider event/message ID 和可用
+的 `msg_seq`，以便进程重启后重建被动 `ReplyTarget`。数据库 migration
+`0008_qq_reply_targets` 提供该恢复边界。被动回复优先使用持久化 target；
+主动推送只使用明确的 C2C `user_openid`，不携带过期的被动字段。
+
+同步业务层 `QQGateway` 与 botpy 异步 Client 之间使用生命周期拥有的异步
+bridge。SDK 类型不泄露到业务层，所有调用有明确超时和关闭语义。
+
+### 附件、文件与媒体
+
+入站附件按 URL + metadata 处理，并在当前实现中于事件持久化前完成受限下载：
+
+```text
+HTTPS-only
+大小 / MIME / 文件头校验
+SSRF、私网地址和重定向限制
+总 deadline 覆盖初始及 redirect DNS 解析
+单附件约束
+最终文件与 .part 清理
+```
+
+出站普通文件和图片路径已有 SDK mapping 与本地契约测试，但 SDK 方法存在
+不等于真实账号具备能力；在真实 QQ 在线冒烟完成前，文件/图片能力仍标记为
+`capability_pending`，不作为生产可用承诺。
+
+### 出站结果与错误语义
+
+botpy 结果统一映射为：
+
+```text
+成功
+确定性永久失败
+确定性可重试失败
+结果不确定（ambiguous）
+```
+
+成功时保存脱敏后的 provider message ID。主动非幂等 POST 在结果不确定时
+不得盲目自动重试，以避免重复消息；持久化 Notification 仍遵守
+`At-least-once Delivery + Idempotent Consumer`，允许极端情况下重复发送，
+但不产生重复业务事实。
+
+### 安全与在线边界
+
+本地契约已覆盖签名重放缓存容量、dispatch 时间新鲜度、malformed attachment、
+文件头校验、SSRF/重定向、DNS deadline、临时文件清理和外部错误脱敏。凭据、
+签名、完整 openid、provider payload、URL query 和附件内容不得进入日志或
+证据。
+
+这些结果只证明仓库内的确定性实现契约。真实 token/API endpoint 兼容性、
+URL challenge、C2C 收发、附件下载、普通文件/图片发送、ambiguous provider
+结果和重启恢复仍需要具备公网 HTTPS、经操作者批准的凭据/recipient 以及
+人工 live smoke；在此之前统一标记为 `BLOCKED`。详细设计、部署前提和当前
+证据分别见 [`docs/qq-botpy-adapter-design.md`](./qq-botpy-adapter-design.md)、
+[`docs/deployment.md`](./deployment.md) 和
+`.omo/evidence/task-8-qq-botpy-sdk-adapter.md`。
+
+---
+
 # 26. Notification 事件消费策略
 
 对于：
@@ -1746,7 +1877,16 @@ QQ User ─→ Conversation Agent       JobMailAnalysis
 
 # 47. 当前设计状态
 
-总体架构已经基本完成，可以进入实现阶段。
+总体架构和 botpy 适配器的确定性本地实现已经完成，可以进入部署前的
+真实平台验收阶段。当前状态必须区分本地契约与在线兼容性：
+
+```text
+本地 botpy adapter / webhook / lifecycle / C2C target / 安全边界
+→ 已实现并通过确定性验证
+
+真实 QQ endpoint、账号能力、文件/图片能力、在线重启恢复
+→ 尚未验证，保持 human-gated BLOCKED
+```
 
 后续主要属于实现级细化：
 
@@ -1754,7 +1894,7 @@ QQ User ─→ Conversation Agent       JobMailAnalysis
 - Tool JSON Schema
 - Prompt / Structured Output Schema
 - IMAP 处理细节
-- QQ SDK 适配
+- 真实 QQ endpoint 与账号能力在线验收
 - Chroma Collection 设计
 - Chunking 参数
 - Embedding Model 选型

@@ -6,7 +6,9 @@ from dataclasses import dataclass, field
 from jobs_status_manager.agent.contracts import (
     ConversationPrompt,
     ConversationResponse,
+    ProviderError,
     QQInboundEvent,
+    ReplyTarget,
 )
 from jobs_status_manager.knowledge.contracts import VectorHit, VectorRecord
 from jobs_status_manager.mail import JobMailAnalysisInput, MailEnvelope
@@ -22,6 +24,7 @@ class FakeQQDeliveryResult:
 
     success: bool = True
     provider_message_id: str | None = "fake-message"
+    provider_error: ProviderError | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +32,7 @@ class RecordingFake:
     """Base fake recording calls and returning configured outcomes."""
 
     calls: list[tuple[str, tuple[str, ...]]] = field(default_factory=list)
-    error: RuntimeError | None = None
+    error: Exception | None = None
 
     def record(self, name: str, *values: str) -> None:
         """Record a call or raise its configured error."""
@@ -91,6 +94,57 @@ class FakeQQGateway(RecordingFake):
     def push(self, user_id: str, content: str) -> FakeQQDeliveryResult:
         """Record an outbound push."""
         self.record("push", user_id, content)
+        return self.delivery
+
+    def deliver(self, target: ReplyTarget, content: str) -> FakeQQDeliveryResult:
+        """Record a target-aware local delivery operation."""
+        self.record(
+            "deliver",
+            target.mode.value,
+            target.provider_name,
+            target.provider_scope,
+            target.target_id,
+            target.message_id or "",
+            target.event_id or "",
+            "" if target.msg_seq is None else str(target.msg_seq),
+            content,
+        )
+        return self.delivery
+
+    def send_file(
+        self,
+        target: ReplyTarget,
+        filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> FakeQQDeliveryResult:
+        """Record a local file delivery operation."""
+        self.record(
+            "send_file",
+            target.provider_name,
+            target.provider_scope,
+            target.target_id,
+            filename,
+            content_type,
+            str(len(content)),
+        )
+        return self.delivery
+
+    def send_image(
+        self,
+        target: ReplyTarget,
+        content_type: str,
+        content: bytes,
+    ) -> FakeQQDeliveryResult:
+        """Record a local image delivery operation."""
+        self.record(
+            "send_image",
+            target.provider_name,
+            target.provider_scope,
+            target.target_id,
+            content_type,
+            str(len(content)),
+        )
         return self.delivery
 
 

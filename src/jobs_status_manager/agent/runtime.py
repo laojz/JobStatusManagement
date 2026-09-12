@@ -9,20 +9,25 @@ from typing import TYPE_CHECKING
 from sqlalchemy import select
 
 from jobs_status_manager.agent.contracts import (
+    MAX_AGENT_DELIVERY_ATTEMPTS,
     MAX_RUN_SECONDS,
     MAX_TOOL_CALLS,
     MAX_TOOL_RESULT_CHARS,
     MAX_TOOL_SECONDS,
     AgentRunState,
+    ProviderErrorKind,
+    ReplyTarget,
 )
 from jobs_status_manager.agent.delivery import (
     DeliveryOutcome,
     complete_run,
     persist_final_message,
+    promote_next_run,
     record_command_delivery,
     record_delivery,
 )
 from jobs_status_manager.agent.models import AgentRun
+from jobs_status_manager.agent.models import Session as AgentSession
 from jobs_status_manager.agent.runtime_support import load_context
 from jobs_status_manager.agent.tools import execute
 from jobs_status_manager.agent.turn_runtime import run_turns
@@ -47,6 +52,7 @@ if TYPE_CHECKING:
         ChromaAdapter,
         EmbeddingAdapter,
         LLMAdapter,
+        QQDeliveryResult,
         QQGateway,
     )
     from jobs_status_manager.infrastructure.clock import Clock
@@ -73,18 +79,14 @@ class RuntimeServices:
     tool_timeout_seconds: float = MAX_TOOL_SECONDS
     max_result_chars: int = MAX_TOOL_RESULT_CHARS
     tool_executor: ToolExecutor = execute
+    proactive_target: ReplyTarget | None = None
+    max_delivery_attempts: int = MAX_AGENT_DELIVERY_ATTEMPTS
 
 
 def process_run(services: RuntimeServices, run_id: str) -> None:
     """Process one persisted run with sequential bounded tool calls."""
-    with transaction(services.database) as session:
-        run = session.get(AgentRun, run_id)
-        if run is None:
-            return
-        if run.state == AgentRunState.RUNNING.value and run.started_at is None:
-            run.started_at = services.clock.now()
-            run.attempt_count += 1
-            run.next_retry_at = None
+    if not _prepare_run_attempt(services, run_id):
+        return
     context = load_context(services.database, run_id)
     if context is None:
         return
@@ -107,22 +109,66 @@ def process_run(services: RuntimeServices, run_id: str) -> None:
             if run is not None and run.state == AgentRunState.WAITING_USER_CONFIRMATION.value:
                 return
     if answer is not None:
-        _deliver_answer(services, context, answer)
+        if route_command(context.user_message).resolution is not None:
+            _deliver_command_answer(services, context, answer)
+        else:
+            _deliver_answer(services, context, answer)
     else:
         complete_run(services, context, answer, error, DeliveryOutcome())
+
+
+def _prepare_run_attempt(services: RuntimeServices, run_id: str) -> bool:
+    """Claim one due execution or delivery attempt and enforce its bound."""
+    with transaction(services.database) as session:
+        run = session.get(AgentRun, run_id)
+        if run is None:
+            return False
+        now = services.clock.now()
+        if run.state == AgentRunState.DELIVERY_PENDING.value:
+            next_retry_at = run.next_retry_at
+            if next_retry_at is not None and next_retry_at.tzinfo is None:
+                next_retry_at = next_retry_at.replace(tzinfo=now.tzinfo)
+            elif next_retry_at is not None:
+                next_retry_at = next_retry_at.astimezone(now.tzinfo)
+            if next_retry_at is not None and next_retry_at > now:
+                return False
+            if run.attempt_count >= services.max_delivery_attempts:
+                run.state = AgentRunState.FAILED.value
+                run.delivery_state = "FAILED"
+                run.delivery_error = "delivery attempts exhausted"
+                run.next_retry_at = None
+                run.completed_at = now
+                session_row = session.get(AgentSession, run.session_id)
+                if session_row is not None and session_row.active_run_id == run.id:
+                    session_row.active_run_id = None
+                    promote_next_run(session, run.session_id, now)
+                return False
+            run.attempt_count += 1
+            run.next_retry_at = None
+        elif run.state == AgentRunState.RUNNING.value and run.started_at is None:
+            run.started_at = now
+            run.attempt_count += 1
+            run.next_retry_at = None
+        return True
 
 
 def _deliver_answer(services: RuntimeServices, context: RunContext, answer: str) -> None:
     persist_final_message(services, context, answer)
     try:
-        delivery = services.qq.push(context.user_id, answer)
-    except (RuntimeError, ValueError, TimeoutError) as exception:
-        outcome = DeliveryOutcome("FAILED", safe_external_error(exception))
+        delivery = _deliver_text(services, context, answer)
+    except Exception as exception:  # noqa: BLE001,BROAD_EXCEPT_OK
+        outcome = DeliveryOutcome(
+            "FAILED",
+            safe_external_error(exception),
+            None,
+            ProviderErrorKind.AMBIGUOUS,
+        )
     else:
         outcome = DeliveryOutcome(
             "SENT" if delivery.success else "FAILED",
             None if delivery.success else "QQ provider rejected delivery",
             delivery.provider_message_id,
+            None if delivery.provider_error is None else delivery.provider_error.kind,
         )
     record_delivery(services, context, outcome)
 
@@ -132,17 +178,32 @@ def _deliver_command_answer(
     context: RunContext,
     answer: str,
 ) -> None:
+    persist_final_message(services, context, answer)
     try:
-        delivery = services.qq.push(context.user_id, answer)
-    except (RuntimeError, ValueError, TimeoutError) as exception:
-        outcome = DeliveryOutcome("FAILED", safe_external_error(exception))
+        delivery = _deliver_text(services, context, answer)
+    except Exception as exception:  # noqa: BLE001,BROAD_EXCEPT_OK
+        outcome = DeliveryOutcome(
+            "FAILED",
+            safe_external_error(exception),
+            None,
+            ProviderErrorKind.AMBIGUOUS,
+        )
     else:
         outcome = DeliveryOutcome(
             "SENT" if delivery.success else "FAILED",
             None if delivery.success else "QQ provider rejected delivery",
             delivery.provider_message_id,
+            None if delivery.provider_error is None else delivery.provider_error.kind,
         )
     record_command_delivery(services, context, answer, outcome)
+
+
+def _deliver_text(services: RuntimeServices, context: RunContext, answer: str) -> QQDeliveryResult:
+    """Select a durable passive target, explicit proactive target, or legacy mapping."""
+    target = context.reply_target or services.proactive_target
+    if target is None:
+        return services.qq.push(context.user_id, answer)
+    return services.qq.deliver(target, answer)
 
 
 def _process_confirmation(

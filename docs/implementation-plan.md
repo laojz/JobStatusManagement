@@ -4,6 +4,25 @@
 
 本计划只覆盖从空仓库到可部署 v1 的实施顺序和验收方式，不包含业务代码实现。
 
+## Current Verification Status
+
+截至 2026-09-12，QQ botpy 适配器的确定性本地实现已完成并通过当前工作树验收：
+
+```text
+qq-botpy-sdk==2.0.4
+full suite: 267 passed in 8.28s
+Ruff / format / basedpyright / uv lock / Alembic / diff checks: PASS
+Alembic head: 0008_qq_reply_targets (head)
+```
+
+该结果覆盖自定义 Webhook transport、持久化后 ACK、重复事件幂等、C2C
+ReplyTarget 重建、同步到异步发送桥、附件安全边界和出站错误分类。它不等同
+于真实 QQ 兼容性验收：token/API endpoint、URL challenge、C2C 收发、附件、
+普通文件/图片、ambiguous provider outcome 和真实重启恢复仍为 human-gated
+`BLOCKED`。历史 Phase 6 的 `120 tests` 结果继续保留为当时的阶段快照，不与
+当前完整套件计数混用。可复核证据见
+[`../.omo/evidence/task-8-qq-botpy-sdk-adapter.md`](../.omo/evidence/task-8-qq-botpy-sdk-adapter.md)。
+
 ## 0. Implementation Principles
 
 ### 0.1 架构事实与实现建议

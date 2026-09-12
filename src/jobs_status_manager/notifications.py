@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from jobs_status_manager.agent.contracts import ProviderErrorKind
 from jobs_status_manager.infrastructure.database.transactions import transaction
 from jobs_status_manager.infrastructure.safe_errors import safe_external_error
 from jobs_status_manager.notification_models import Notification, NotificationAttempt
@@ -47,6 +48,7 @@ class DeliveryOutcome:
     success: bool
     provider_message_id: str | None
     error: str | None
+    provider_error_kind: ProviderErrorKind | None = None
 
 
 def ordinary_content(company: str, position: str, summary: str) -> str:
@@ -147,6 +149,15 @@ def dispatch_once(services: NotificationServices, gateway: QQGateway, max_attemp
                     success=result.success,
                     provider_message_id=result.provider_message_id,
                     error=None if result.success else "provider rejected push",
+                    provider_error_kind=(
+                        None
+                        if result.success
+                        else (
+                            result.provider_error.kind
+                            if result.provider_error is not None
+                            else ProviderErrorKind.RETRYABLE
+                        )
+                    ),
                 ),
                 max_attempts=max_attempts,
             )
@@ -184,11 +195,23 @@ def _finish_attempt(
             notification.last_error = None
             notification.next_retry_at = None
         else:
-            attempt.result = "FAILED"
+            attempt.result = (
+                outcome.provider_error_kind.value
+                if outcome.provider_error_kind is not None
+                else "FAILED"
+            )
             notification.last_error = (
                 outcome.error if outcome.error is not None else "delivery failed"
             )
-            if notification.attempt_count >= max_attempts:
+            if (
+                outcome.provider_error_kind
+                in (
+                    ProviderErrorKind.PERMANENT,
+                    ProviderErrorKind.DEFINITE,
+                    ProviderErrorKind.AMBIGUOUS,
+                )
+                or notification.attempt_count >= max_attempts
+            ):
                 notification.state = NotificationState.FAILED.value
                 notification.next_retry_at = None
             else:

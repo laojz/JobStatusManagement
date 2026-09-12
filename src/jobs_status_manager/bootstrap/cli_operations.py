@@ -170,7 +170,7 @@ def register(app: typer.Typer) -> None:  # noqa: C901, PLR0915
         try:
             database = Database(settings.database_path)
             revision = current_revision(f"sqlite:///{settings.database_path}")
-            if revision != "0007_phase6_reliability":
+            if revision != "0008_qq_reply_targets":
                 typer.echo("rebuild unavailable: schema is not at head", err=True)
                 raise typer.Exit(code=1)
             summary = rebuild_index(
