@@ -87,3 +87,29 @@ def test_cleanup_preserves_first_error_and_attempts_remaining_resources() -> Non
         anyio.run(_cleanup_lifecycle_resources, QQRuntime(), Owned(), Database())
 
     assert events == ["qq", "owned", "database"]
+
+
+def test_cleanup_attempts_remaining_resources_after_unexpected_qq_error() -> None:
+    # Given
+    events: list[str] = []
+
+    class QQRuntime:
+        async def close(self) -> None:
+            events.append("qq")
+            message = "qq cleanup failed"
+            raise AttributeError(message)
+
+    class Owned:
+        def close(self) -> None:
+            events.append("owned")
+
+    class Database:
+        def dispose(self) -> None:
+            events.append("database")
+
+    # When
+    with pytest.raises(AttributeError, match="qq cleanup failed"):
+        anyio.run(_cleanup_lifecycle_resources, QQRuntime(), Owned(), Database())
+
+    # Then
+    assert events == ["qq", "owned", "database"]

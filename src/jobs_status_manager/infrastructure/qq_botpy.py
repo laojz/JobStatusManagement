@@ -53,6 +53,7 @@ HTTP_TOO_MANY_REQUESTS: Final = 429
 HTTP_SERVER_ERROR: Final = 500
 DEFAULT_DISPATCH_TIMESTAMP_MAX_AGE_SECONDS: Final = 300
 VALIDATION_SIGNATURE_CACHE_LIMIT: Final = 1024
+_BOTPY_CLIENT_CLASS: Final = botpy.Client
 
 
 type BotpySdkResult = Message | MediaSendResult
@@ -416,11 +417,12 @@ class StarletteEventTransport(RequestTransport):
         if self._closed:
             message = "event transport is closed"
             raise RuntimeError(message)
+        ready_event = self._ready_event or anyio.Event()
         self._handler = handler
         self._stop_event = anyio.Event()
-        self._ready_event = anyio.Event()
+        self._ready_event = ready_event
         self._running = True
-        self._ready_event.set()
+        ready_event.set()
         try:
             await self._stop_event.wait()
         finally:
@@ -428,6 +430,10 @@ class StarletteEventTransport(RequestTransport):
             self._stop_event = None
             self._ready_event = None
             self._running = False
+
+    def prepare_start(self) -> None:
+        """Prepare the readiness handshake before the SDK coroutine is scheduled."""
+        self._ready_event = anyio.Event()
 
     def bind_handler_task_group(self, task_group: anyio.abc.TaskGroup) -> None:
         """Bind post-receipt handlers to the lifecycle-owned task group."""
@@ -595,6 +601,43 @@ class StarletteEventTransport(RequestTransport):
         )
 
 
+async def _retain_async_cleanup_error(
+    operation: Awaitable[None],
+    first_error: BaseException | None,
+) -> BaseException | None:
+    try:
+        await operation
+    except BaseException as error:  # noqa: BLE001
+        return first_error if first_error is not None else error
+    return first_error
+
+
+async def _close_owned_botpy_httpx_sessions(client: botpy.Client) -> None:
+    cleanup_error: BaseException | None = None
+    api_client = client.http._client  # noqa: SLF001
+    if api_client is not None:
+        if api_client._owns_session:  # noqa: SLF001
+            api_session = api_client._session  # noqa: SLF001
+            if api_session is not None and not api_session.is_closed:
+                cleanup_error = await _retain_async_cleanup_error(
+                    api_session.aclose(), cleanup_error
+                )
+        cleanup_error = await _retain_async_cleanup_error(api_client.close(), cleanup_error)
+
+    token = client.http._token  # noqa: SLF001
+    if token is not None:
+        token_manager = token._manager  # noqa: SLF001
+        if token_manager._owns_session:  # noqa: SLF001
+            token_session = token_manager._session  # noqa: SLF001
+            if token_session is not None and not token_session.is_closed:
+                cleanup_error = await _retain_async_cleanup_error(
+                    token_session.aclose(), cleanup_error
+                )
+        cleanup_error = await _retain_async_cleanup_error(token_manager.close(), cleanup_error)
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 class LifespanBotpyRuntime:
     """Own exactly one SDK client and one externally-served transport."""
 
@@ -647,12 +690,14 @@ class LifespanBotpyRuntime:
             await self.transport.wait_ready()
             self._started = True
             return
+        if isinstance(self.transport, StarletteEventTransport):
+            self.transport.prepare_start()
         task_group.start_soon(_await_transport, transport_task)
         await self.transport.wait_ready()
         self._started = True
 
     async def close(self) -> None:
-        """Close client resources first, then explicitly close the transport."""
+        """Attempt every client and transport cleanup, then raise the first failure."""
         if self._closed:
             return
         self._closed = True
@@ -660,10 +705,16 @@ class LifespanBotpyRuntime:
         with anyio.CancelScope(shield=True):
             if isinstance(self.gateway, BotpyQQGateway):
                 self.gateway.close()
+            if isinstance(self.client, _BOTPY_CLIENT_CLASS):
+                try:
+                    await _close_owned_botpy_httpx_sessions(self.client)
+                except BaseException as error:  # noqa: BLE001
+                    cleanup_error = error
             try:
                 await self.client.close()
             except BaseException as error:  # noqa: BLE001
-                cleanup_error = error
+                if cleanup_error is None:
+                    cleanup_error = error
             try:
                 await self.transport.close()
             except BaseException as error:  # noqa: BLE001

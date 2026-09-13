@@ -14,7 +14,9 @@ from uuid import UUID
 
 import anyio
 import botpy
+import httpx
 import pytest
+from botpy.protocol.http import ApiClient
 from botpy.protocol.message import MediaSendResult, MessageType
 from botpy.protocol.models import RawEvent
 from botpy.protocol.models import ReplyTarget as SdkReplyTarget
@@ -24,6 +26,7 @@ from botpy.protocol.transport import (
     ed25519_sign,
     sign_validation_response,
 )
+from botpy.robot import Token
 from pydantic import SecretStr
 
 from jobs_status_manager.agent import uploads
@@ -1503,6 +1506,35 @@ async def test_runtime_close_is_idempotent() -> None:
 
 
 @pytest.mark.anyio
+async def test_runtime_start_waits_until_real_event_transport_is_started() -> None:
+    # Given
+    transport = StarletteEventTransport("app-id", "secret", _noop_event)
+
+    async def handle_event(_: RawEvent) -> None:
+        return None
+
+    class FakeSdkClient:
+        async def start(self, appid: str, secret: str, ret_coro: bool) -> Awaitable[None]:
+            assert (appid, secret, ret_coro) == ("app-id", "secret", True)
+            return transport.start(handle_event)
+
+        async def close(self) -> None:
+            return None
+
+    runtime = LifespanBotpyRuntime(FakeSdkClient(), transport, "app-id", "secret")
+
+    # When
+    async with anyio.create_task_group() as task_group:
+        await runtime.start(task_group)
+
+        # Then
+        response = await runtime.handle_http_request(b"not-json", {})
+        assert response.status == 400
+        await runtime.close()
+        task_group.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
 async def test_runtime_waits_for_transport_readiness_before_returning() -> None:
     ready = anyio.Event()
     handled = anyio.Event()
@@ -1539,6 +1571,98 @@ async def test_runtime_waits_for_transport_readiness_before_returning() -> None:
         await handled.wait()
         assert response.status == 200
         task_group.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_runtime_close_supports_botpy_owned_httpx_async_session() -> None:
+    # Given
+    class TokenProvider:
+        app_id = "app-id"
+
+        async def get_access_token(self, force_refresh: bool = False) -> str:
+            return "token"
+
+    transport = StarletteEventTransport("app-id", "secret", _noop_event)
+    client = botpy.Client(
+        intents=botpy.Intents.none(),
+        bot_log=False,
+        ext_handlers=False,
+        transport=transport,
+    )
+    api_client = ApiClient(TokenProvider())
+    api_session = httpx.AsyncClient()
+    api_client._session = api_session
+    client.http._client = api_client
+    token = Token("app-id", "secret")
+    token_session = httpx.AsyncClient()
+    token._manager._session = token_session
+    client.http._token = token
+    runtime = LifespanBotpyRuntime(client, transport, "app-id", "secret")
+
+    try:
+        # When
+        await runtime.close()
+
+        # Then
+        assert (api_session.is_closed, token_session.is_closed) == (True, True)
+    finally:
+        await api_session.aclose()
+        await token_session.aclose()
+
+
+@pytest.mark.anyio
+async def test_runtime_close_attempts_all_cleanup_after_api_session_aclose_fails() -> None:
+    # Given
+    events: list[str] = []
+
+    class TokenProvider:
+        app_id = "app-id"
+
+        async def get_access_token(self, force_refresh: bool = False) -> str:
+            return "token"
+
+    class FailingApiSession(httpx.AsyncClient):
+        async def aclose(self) -> None:
+            events.append("api-session")
+            message = "api aclose failed"
+            raise RuntimeError(message)
+
+    class RecordingTokenSession(httpx.AsyncClient):
+        async def aclose(self) -> None:
+            events.append("token-session")
+            await super().aclose()
+
+    transport = StarletteEventTransport("app-id", "secret", _noop_event)
+    client = botpy.Client(
+        intents=botpy.Intents.none(),
+        bot_log=False,
+        ext_handlers=False,
+        transport=transport,
+    )
+    api_client = ApiClient(TokenProvider())
+    api_session = FailingApiSession()
+    api_client._session = api_session
+    client.http._client = api_client
+    token = Token("app-id", "secret")
+    token_session = RecordingTokenSession()
+    token._manager._session = token_session
+    client.http._token = token
+    runtime = LifespanBotpyRuntime(client, transport, "app-id", "secret")
+
+    try:
+        # When
+        with pytest.raises(RuntimeError, match="api aclose failed"):
+            await runtime.close()
+
+        # Then
+        assert (events, client.is_closed(), transport._closed) == (
+            ["api-session", "token-session"],
+            True,
+            True,
+        )
+    finally:
+        await httpx.AsyncClient.aclose(api_session)
+        await httpx.AsyncClient.aclose(token_session)
 
 
 @pytest.mark.anyio

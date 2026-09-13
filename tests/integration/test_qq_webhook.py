@@ -370,6 +370,61 @@ def test_lifespan_automatically_constructs_botpy_without_explicit_qq(
     ]
 
 
+def test_lifespan_preserves_startup_error_when_qq_cleanup_also_fails(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    # Given
+    _setup(database, settings, fake_clock)
+    lifecycle_calls: list[str] = []
+
+    class FakeClient:
+        async def start(self, appid: str, secret: str, ret_coro: bool) -> None:
+            lifecycle_calls.append("start")
+            message = "startup failed"
+            raise RuntimeError(message)
+
+        async def close(self) -> None:
+            lifecycle_calls.append("client-close")
+            message = "cleanup failed"
+            raise RuntimeError(message)
+
+    class FakeTransport:
+        async def handle_request(self, request: WebhookRequest) -> WebhookResponse:
+            return WebhookResponse(200, request.body)
+
+        async def wait_ready(self) -> None:
+            return None
+
+        async def close(self) -> None:
+            lifecycle_calls.append("transport-close")
+
+    def factory(_: AppSettings) -> LifespanBotpyRuntime:
+        lifecycle_calls.append("factory")
+        return LifespanBotpyRuntime(FakeClient(), FakeTransport(), "app-id", "app-secret")
+
+    app = create_app(
+        settings,
+        Path(__file__).resolve().parents[2],
+        LifecycleAdapters(clock=fake_clock, qq_botpy_factory=factory),
+    )
+
+    # When
+    with (
+        pytest.RaisesGroup(
+            pytest.RaisesExc(RuntimeError, match="^startup failed$"),
+            match="^unhandled errors in a TaskGroup",
+        ) as caught,
+        TestClient(app),
+    ):
+        pytest.fail("lifespan startup must fail before yielding")
+
+    # Then
+    assert all("cleanup failed" not in str(error) for error in caught.value.exceptions)
+    assert lifecycle_calls == ["factory", "start", "client-close", "transport-close"]
+
+
 def test_lifespan_owns_one_explicit_botpy_runtime_and_closes_it(
     database: Database,
     settings: AppSettings,

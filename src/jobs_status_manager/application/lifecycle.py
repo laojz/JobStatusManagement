@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from functools import partial
@@ -137,19 +138,19 @@ async def _cleanup_lifecycle_resources(
         if qq_runtime is not None:
             try:
                 await qq_runtime.close()
-            except (OSError, RuntimeError, ValueError, SQLAlchemyError) as error:
+            except BaseException as error:
                 cleanup_error = error
                 logger.exception("qq_runtime_close_failed")
         if owned is not None:
             try:
                 owned.close()
-            except (OSError, RuntimeError, ValueError, SQLAlchemyError) as error:
+            except BaseException as error:
                 if cleanup_error is None:
                     cleanup_error = error
                 logger.exception("owned_adapter_close_failed")
         try:
             database.dispose()
-        except (OSError, RuntimeError, ValueError, SQLAlchemyError) as error:
+        except BaseException as error:
             if cleanup_error is None:
                 cleanup_error = error
             logger.exception("database_dispose_failed")
@@ -470,46 +471,62 @@ def create_app(
             readiness = _readiness_state(settings, effective_adapters)
             _startup_recovery(database, effective_adapters, settings)
             async with anyio.create_task_group() as task_group:
-                if qq_runtime is not None:
-                    await qq_runtime.start(task_group)
-                task_group.start_soon(
-                    _worker_loop,
-                    "imap-poller",
-                    partial(_poll_cycle, database, effective_adapters),
-                )
-                task_group.start_soon(
-                    _worker_loop,
-                    "outbox-publisher",
-                    partial(_publish_cycle, database, effective_adapters),
-                )
-                task_group.start_soon(
-                    _worker_loop,
-                    "notification-dispatcher",
-                    partial(_dispatch_cycle, database, effective_adapters),
-                )
-                task_group.start_soon(
-                    _worker_loop,
-                    "notification-recovery",
-                    partial(_recover_notifications, database, effective_adapters),
-                )
-                task_group.start_soon(
-                    _worker_loop,
-                    "conversation-agent",
-                    partial(_agent_cycle, database, effective_adapters, settings),
-                )
-                task_group.start_soon(
-                    _worker_loop,
-                    "knowledge-index",
-                    partial(_knowledge_cycle, database, effective_adapters),
-                )
-                yield {"database": database, "project_root": project_root, "readiness": readiness}
-                readiness["product_readiness"] = "not_ready"
-                task_group.cancel_scope.cancel()
+                try:
+                    if qq_runtime is not None:
+                        await qq_runtime.start(task_group)
+                    task_group.start_soon(
+                        _worker_loop,
+                        "imap-poller",
+                        partial(_poll_cycle, database, effective_adapters),
+                    )
+                    task_group.start_soon(
+                        _worker_loop,
+                        "outbox-publisher",
+                        partial(_publish_cycle, database, effective_adapters),
+                    )
+                    task_group.start_soon(
+                        _worker_loop,
+                        "notification-dispatcher",
+                        partial(_dispatch_cycle, database, effective_adapters),
+                    )
+                    task_group.start_soon(
+                        _worker_loop,
+                        "notification-recovery",
+                        partial(_recover_notifications, database, effective_adapters),
+                    )
+                    task_group.start_soon(
+                        _worker_loop,
+                        "conversation-agent",
+                        partial(_agent_cycle, database, effective_adapters, settings),
+                    )
+                    task_group.start_soon(
+                        _worker_loop,
+                        "knowledge-index",
+                        partial(_knowledge_cycle, database, effective_adapters),
+                    )
+                    yield {
+                        "database": database,
+                        "project_root": project_root,
+                        "readiness": readiness,
+                    }
+                finally:
+                    readiness["product_readiness"] = "not_ready"
+                    task_group.cancel_scope.cancel()
         finally:
+            primary_error = sys.exception()
             readiness["product_readiness"] = "not_ready"
             runtime_to_close = qq_runtime
             qq_runtime = None
-            await _cleanup_lifecycle_resources(runtime_to_close, owned, database)
+            try:
+                await _cleanup_lifecycle_resources(runtime_to_close, owned, database)
+            except BaseException as cleanup_error:
+                if primary_error is None:
+                    raise
+                logger.exception(
+                    "lifecycle_cleanup_failed_secondary",
+                    cleanup_error=type(cleanup_error).__name__,
+                    primary_error=type(primary_error).__name__,
+                )
 
     routes = [
         Route("/live", live, methods=["GET"]),
