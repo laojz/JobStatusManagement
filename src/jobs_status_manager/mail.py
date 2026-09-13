@@ -6,7 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import StrEnum, unique
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -32,12 +32,13 @@ class MailEnvelope:
     content: str
 
 
-class IMAPGateway(Protocol):
-    """Synchronous IMAP polling capability."""
+@dataclass(frozen=True, slots=True)
+class MailPollBatch:
+    """Provider-neutral result of one IMAP poll."""
 
-    def poll(self, account_key: str, cursor: str | None) -> list[MailEnvelope]:
-        """Return envelopes after the cursor in provider order, possibly with duplicates."""
-        ...
+    envelopes: tuple[MailEnvelope, ...]
+    next_cursor: str
+    reset: bool
 
 
 @unique
@@ -144,14 +145,6 @@ class JobMailAnalysisInput(BaseModel):
     details: AnalysisDetails = AnalysisDetails()
     summary: str = Field(min_length=1, max_length=2000)
     confidence: AnalysisConfidence
-
-
-class LLMAdapter(Protocol):
-    """Synchronous typed LLM boundary."""
-
-    def analyze_job_mail(self, prompt: str) -> JobMailAnalysisInput:
-        """Return a validated structured analysis."""
-        ...
 
 
 def classify_mail(subject: str, content: str) -> MailClassification:

@@ -166,6 +166,12 @@ def register(app: typer.Typer) -> None:  # noqa: C901, PLR0915
                 err=True,
             )
             raise typer.Exit(code=1)
+        if resources.embedding is None or resources.chroma is None:
+            typer.echo(
+                "rebuild unavailable: embedding adapter and Chroma path are required",
+                err=True,
+            )
+            raise typer.Exit(code=1)
         database = None
         try:
             database = Database(settings.database_path)

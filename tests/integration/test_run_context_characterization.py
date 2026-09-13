@@ -50,12 +50,30 @@ def test_load_context_preserves_legacy_run_shape(
             ),
             {"state": AgentRunState.RUNNING.value, "now": now},
         )
+        connection.execute(
+            text(
+                "INSERT INTO tool_calls "
+                "(id, agent_run_id, tool_name, arguments, sequence, created_at) "
+                "VALUES ('provider-call-1', 'run', 'GetRecentMails', '{}', 1, :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO tool_results "
+                "(id, tool_call_id, data, context_refs, error, started_at, completed_at, "
+                "created_at) "
+                "VALUES ('result-1', 'provider-call-1', 'data', '{}', NULL, :now, :now, :now)"
+            ),
+            {"now": now},
+        )
 
     context = load_context(database, "run")
 
     assert context is not None
     assert context.user_message == "hello"
     assert context.state == AgentRunState.RUNNING.value
+    assert context.tool_results[0].tool_call_id == "provider-call-1"
 
 
 def test_fake_qq_gateway_records_existing_reply_and_push_shapes() -> None:

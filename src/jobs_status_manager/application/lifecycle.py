@@ -1,9 +1,12 @@
-"""Starlette application lifecycle."""
+"""Starlette application lifecycle.
+
+# noqa: SIZE_OK: application startup, workers, routes, and shutdown stay together.
+"""
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, TypedDict
 
@@ -33,7 +36,12 @@ from jobs_status_manager.application.health import health
 from jobs_status_manager.application_core.service import recover_pending_actions
 from jobs_status_manager.event_pipeline import EventServices, publish_once
 from jobs_status_manager.identity.models import MailAccount
-from jobs_status_manager.infrastructure.adapters.factory import create_owned_adapters
+from jobs_status_manager.infrastructure.adapters.factory import (
+    AdapterCapabilities,
+    AdapterConfigurationError,
+    OwnedAdapters,
+    create_owned_adapters,
+)
 from jobs_status_manager.infrastructure.clock import SystemClock
 from jobs_status_manager.infrastructure.database.connection import Database
 from jobs_status_manager.infrastructure.ids import UUIDGenerator
@@ -88,10 +96,26 @@ class LifecycleAdapters:
     qq_botpy_factory: Callable[[AppSettings], LifespanBotpyRuntime] | None = None
 
 
+class ReadinessState(TypedDict):
+    """In-memory external wiring status shared with the health endpoint."""
+
+    runtime_mode: str
+    imap: str
+    llm: str
+    product_readiness: str
+
+
 class ClosableResource(Protocol):
     """Synchronous resource that can be closed during lifespan teardown."""
 
     def close(self) -> None:
+        """Release owned resource state."""
+
+
+class AsyncClosableResource(Protocol):
+    """Asynchronous resource that can be closed during lifespan teardown."""
+
+    async def close(self) -> None:
         """Release owned resource state."""
 
 
@@ -103,7 +127,7 @@ class DisposableResource(Protocol):
 
 
 async def _cleanup_lifecycle_resources(
-    qq_runtime: LifespanBotpyRuntime | None,
+    qq_runtime: AsyncClosableResource | None,
     owned: ClosableResource | None,
     database: DisposableResource,
 ) -> None:
@@ -113,24 +137,119 @@ async def _cleanup_lifecycle_resources(
         if qq_runtime is not None:
             try:
                 await qq_runtime.close()
-            except BaseException as error:
+            except (OSError, RuntimeError, ValueError, SQLAlchemyError) as error:
                 cleanup_error = error
                 logger.exception("qq_runtime_close_failed")
         if owned is not None:
             try:
                 owned.close()
-            except BaseException as error:
+            except (OSError, RuntimeError, ValueError, SQLAlchemyError) as error:
                 if cleanup_error is None:
                     cleanup_error = error
                 logger.exception("owned_adapter_close_failed")
         try:
             database.dispose()
-        except BaseException as error:
+        except (OSError, RuntimeError, ValueError, SQLAlchemyError) as error:
             if cleanup_error is None:
                 cleanup_error = error
             logger.exception("database_dispose_failed")
     if cleanup_error is not None:
         raise cleanup_error
+
+
+def _is_fake_adapter(adapter: IMAPGateway | LLMAdapter) -> bool:
+    adapter_type = type(adapter)
+    return adapter_type.__module__.endswith(".fakes")
+
+
+def _capability_status(enabled: bool, adapter: IMAPGateway | LLMAdapter | None) -> str:
+    if not enabled:
+        return "disabled"
+    if adapter is None:
+        return "not_ready"
+    return "fake" if _is_fake_adapter(adapter) else "ready"
+
+
+def _readiness_state(settings: AppSettings, adapters: LifecycleAdapters) -> ReadinessState:
+    imap_status = _capability_status(settings.imap_enabled, adapters.imap)
+    llm_status = _capability_status(settings.llm_enabled, adapters.llm)
+    required_available = imap_status in {"ready", "fake"} and llm_status in {
+        "ready",
+        "fake",
+    }
+    has_fake = imap_status == "fake" or llm_status == "fake"
+    if settings.runtime_mode == "production":
+        product = "ready" if required_available and not has_fake else "not_ready"
+    elif not settings.imap_enabled and not settings.llm_enabled:
+        product = "local_only"
+    else:
+        product = "ready" if required_available else "not_ready"
+    return {
+        "runtime_mode": settings.runtime_mode,
+        "imap": imap_status,
+        "llm": llm_status,
+        "product_readiness": product,
+    }
+
+
+def _create_runtime_adapters(
+    settings: AppSettings,
+    supplied: LifecycleAdapters,
+) -> tuple[OwnedAdapters | None, LifecycleAdapters]:
+    """Construct missing external adapters while preserving supplied instances."""
+    try:
+        owned = create_owned_adapters(
+            settings,
+            AdapterCapabilities(
+                imap=supplied.imap,
+                llm=supplied.llm,
+                embedding=supplied.embedding,
+                chroma=supplied.chroma,
+            ),
+        )
+    except (AdapterConfigurationError, OSError, RuntimeError, ValueError) as error:
+        if settings.runtime_mode == "production":
+            raise
+        logger.warning(
+            "external_adapter_construction_failed",
+            error=safe_external_error(error),
+        )
+        owned = None
+    if owned is None:
+        return None, supplied
+    return owned, replace(
+        supplied,
+        imap=owned.imap,
+        llm=owned.llm,
+        embedding=owned.embedding,
+        chroma=owned.chroma,
+    )
+
+
+def _create_qq_runtime(
+    database: Database,
+    settings: AppSettings,
+    adapters: LifecycleAdapters,
+) -> LifespanBotpyRuntime | None:
+    """Create the optional QQ runtime without replacing an injected gateway."""
+    if adapters.qq is not None:
+        return None
+    if adapters.qq_botpy_factory is not None:
+        return adapters.qq_botpy_factory(settings)
+    if not (
+        settings.qq_enabled
+        and settings.qq_app_id is not None
+        and settings.qq_app_secret is not None
+        and settings.qq_token_base_url is not None
+    ):
+        return None
+    qq_context = WebhookContext(
+        database,
+        settings,
+        adapters.clock if adapters.clock is not None else SystemClock(),
+        adapters.ids if adapters.ids is not None else UUIDGenerator(),
+    )
+    return create_botpy_runtime(settings, create_botpy_event_handler(qq_context))
 
 
 def _recover_notifications(database: Database, adapters: LifecycleAdapters) -> None:
@@ -286,6 +405,7 @@ class ApplicationState(TypedDict):
 
     database: Database
     project_root: Path
+    readiness: ReadinessState
 
 
 def create_app(
@@ -326,55 +446,28 @@ def create_app(
         nonlocal effective_adapters, qq_runtime
         configure_logging(settings.log_level)
         database = Database(settings.database_path)
-        owned = None
+        owned: OwnedAdapters | None = None
+        readiness: ReadinessState = {
+            "runtime_mode": settings.runtime_mode,
+            "imap": "not_ready",
+            "llm": "not_ready",
+            "product_readiness": "not_ready",
+        }
         try:
-            if supplied_adapters.qq is None and supplied_adapters.qq_botpy_factory is not None:
-                qq_runtime = supplied_adapters.qq_botpy_factory(settings)
-            elif (
-                supplied_adapters.qq is None
-                and settings.qq_enabled
-                and settings.qq_app_id is not None
-                and settings.qq_app_secret is not None
-                and settings.qq_token_base_url is not None
+            owned, effective_adapters = _create_runtime_adapters(settings, supplied_adapters)
+            if settings.runtime_mode == "production" and (
+                effective_adapters.imap is None or effective_adapters.llm is None
             ):
-                qq_context = WebhookContext(
-                    database,
-                    settings,
-                    supplied_adapters.clock
-                    if supplied_adapters.clock is not None
-                    else SystemClock(),
-                    supplied_adapters.ids if supplied_adapters.ids is not None else UUIDGenerator(),
-                )
-                qq_runtime = create_botpy_runtime(
-                    settings,
-                    create_botpy_event_handler(qq_context),
-                )
-            owned = (
-                None
-                if supplied_adapters.embedding is not None and supplied_adapters.chroma is not None
-                else create_owned_adapters(settings)
+                message = "production requires IMAP and LLM adapters"
+                raise AdapterConfigurationError(message)
+            qq_runtime = _create_qq_runtime(database, settings, effective_adapters)
+            effective_adapters = replace(
+                effective_adapters,
+                qq=effective_adapters.qq
+                if effective_adapters.qq is not None
+                else (qq_runtime.gateway if qq_runtime is not None else None),
             )
-            effective_adapters = LifecycleAdapters(
-                imap=supplied_adapters.imap,
-                llm=supplied_adapters.llm,
-                qq=(
-                    supplied_adapters.qq
-                    if supplied_adapters.qq is not None
-                    else (qq_runtime.gateway if qq_runtime is not None else None)
-                ),
-                clock=supplied_adapters.clock,
-                ids=supplied_adapters.ids,
-                embedding=(
-                    supplied_adapters.embedding
-                    if supplied_adapters.embedding is not None
-                    else (owned.embedding if owned is not None else None)
-                ),
-                chroma=(
-                    supplied_adapters.chroma
-                    if supplied_adapters.chroma is not None
-                    else (owned.chroma if owned is not None else None)
-                ),
-            )
+            readiness = _readiness_state(settings, effective_adapters)
             _startup_recovery(database, effective_adapters, settings)
             async with anyio.create_task_group() as task_group:
                 if qq_runtime is not None:
@@ -409,9 +502,11 @@ def create_app(
                     "knowledge-index",
                     partial(_knowledge_cycle, database, effective_adapters),
                 )
-                yield {"database": database, "project_root": project_root}
+                yield {"database": database, "project_root": project_root, "readiness": readiness}
+                readiness["product_readiness"] = "not_ready"
                 task_group.cancel_scope.cancel()
         finally:
+            readiness["product_readiness"] = "not_ready"
             runtime_to_close = qq_runtime
             qq_runtime = None
             await _cleanup_lifecycle_resources(runtime_to_close, owned, database)

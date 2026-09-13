@@ -99,7 +99,11 @@ def load_context(database: Database, run_id: str) -> RunContext | None:
             ).all()[-MAX_RECENT_MESSAGES:]
         )
         tool_results = tuple(
-            PromptToolResult(data=result.data, context_refs=result.context_refs)
+            PromptToolResult(
+                tool_call_id=result.tool_call_id,
+                data=result.data,
+                context_refs=result.context_refs,
+            )
             for result in session.scalars(
                 select(ToolResult)
                 .join(ToolCall, ToolResult.tool_call_id == ToolCall.id)

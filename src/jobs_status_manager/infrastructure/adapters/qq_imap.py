@@ -1,0 +1,43 @@
+"""Public QQ IMAP adapter exports."""
+
+from jobs_status_manager.infrastructure.adapters._qq_imap_gateway import (
+    ConnectionOptions,
+    Cursor,
+    CursorClassification,
+    CursorResetReason,
+    IMAPAuthenticationError,
+    IMAPConfigurationError,
+    IMAPCursorError,
+    IMAPError,
+    IMAPPhase,
+    IMAPProtocolError,
+    IMAPTimeoutError,
+    IMAPTransportError,
+    QQIMAPConfig,
+    QQIMAPGateway,
+    classify_cursor,
+    decode_cursor,
+    encode_cursor,
+    message_to_envelope,
+)
+
+__all__ = [
+    "ConnectionOptions",
+    "Cursor",
+    "CursorClassification",
+    "CursorResetReason",
+    "IMAPAuthenticationError",
+    "IMAPConfigurationError",
+    "IMAPCursorError",
+    "IMAPError",
+    "IMAPPhase",
+    "IMAPProtocolError",
+    "IMAPTimeoutError",
+    "IMAPTransportError",
+    "QQIMAPConfig",
+    "QQIMAPGateway",
+    "classify_cursor",
+    "decode_cursor",
+    "encode_cursor",
+    "message_to_envelope",
+]

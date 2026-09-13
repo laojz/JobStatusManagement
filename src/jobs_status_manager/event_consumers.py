@@ -12,7 +12,7 @@ from jobs_status_manager.application_core.proposals import create_status_proposa
 from jobs_status_manager.infrastructure.database.transactions import transaction
 from jobs_status_manager.mail import JobMailAnalysisInput
 from jobs_status_manager.mail_models import JobMailAnalysis, Mail, ProcessedEvent
-from jobs_status_manager.mail_service import ConsumerMarker, analyze_mail
+from jobs_status_manager.mail_service import AnalysisMetadata, ConsumerMarker, analyze_mail
 from jobs_status_manager.notification_models import Notification
 from jobs_status_manager.notifications import (
     NotificationState,
@@ -51,6 +51,7 @@ def consume_mail_received(services: EventServices, event_id: str, mail_id: str) 
         services.mail,
         mail_id,
         services.llm,
+        metadata=AnalysisMetadata(model_name=getattr(services.llm, "model_name", "fake")),
         marker=ConsumerMarker(consumer_name=consumer, event_id=event_id),
     )
 

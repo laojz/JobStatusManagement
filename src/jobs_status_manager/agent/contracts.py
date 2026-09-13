@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from enum import StrEnum, unique
 from typing import Final
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+import pydantic.json_schema
+from pydantic import BaseModel, ConfigDict, Field, SkipValidation, model_validator
 
 MAX_TOOL_CALLS: Final = 8
 MAX_RUN_SECONDS: Final = 120
@@ -163,7 +164,7 @@ class ToolDefinition(BaseModel):
     category: str
     permission: ToolPermission
     requires_confirmation: bool = False
-    input_schema: dict[str, str] = Field(default_factory=dict)
+    input_schema: SkipValidation[pydantic.json_schema.JsonSchemaValue] = Field(default_factory=dict)
     output_schema: dict[str, str] = Field(default_factory=dict)
 
 
@@ -207,6 +208,7 @@ class PromptToolResult(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    tool_call_id: str = Field(min_length=1, max_length=36)
     data: str = Field(max_length=12000)
     context_refs: dict[str, str | None] = Field(default_factory=dict)
 

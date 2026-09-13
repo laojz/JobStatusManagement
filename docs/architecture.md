@@ -2041,6 +2041,140 @@ Chroma 操作 → 后台任务
 
 所有外部调用都必须在数据库事务之外执行。数据库事务只负责核心业务状态和任务记录，不在事务中等待 LLM、QQ 或 Chroma。
 
+### 48.3.1 QQ IMAP 适配器
+
+QQ 邮箱适配器是 `IMAPGateway` 的基础设施实现，不向业务层泄露
+`imaplib` 类型。v1 固定使用以下边界：
+
+公开模块入口为：
+
+```text
+src/jobs_status_manager/infrastructure/adapters/qq_imap.py
+```
+
+该模块是 provider-neutral 的 `IMAPGateway` façade，只公开适配器契约和
+安全分类所需的类型。具体实现委托给私有模块：
+
+```text
+_qq_imap_gateway.py
+_qq_imap_connection.py
+qq_imap_cursor.py
+qq_imap_mime.py
+```
+
+适配器拥有一次 poll 内的 SSL 连接、登录、readonly `INBOX`、UID 轮询、MIME
+转换、安全错误分类和连接清理。它不拥有数据库写入、轮询 cadence、`Mail`
+持久化、LLM 调用或 durable retry；这些职责分别由后台任务、邮件服务和持久化
+状态机承担。正常 logout/shutdown 之后，清理阶段只忽略普通
+`OSError(errno.EBADF)` 这一种已关闭文件描述符错误，其他清理错误不作静默处理。
+
+```text
+imap.qq.com:993
+SSL
+readonly INBOX
+APP_IMAP_ACCOUNT + APP_IMAP_AUTH_CODE
+定时 poll，不使用 IMAP IDLE
+```
+
+每次 `poll()` 都创建一个新的、证书和主机名校验开启的 SSL 连接，完成
+login、readonly select、UIDVALIDITY 读取、UID SEARCH 和 UID FETCH 后退出登录并
+关闭连接。连接和命令分别有超时；适配器和 HTTP/IMAP transport 不自行重试。
+
+游标是不透明的版本化值，持久化在现有 `MailAccount.polling_cursor`：
+
+```text
+imap-v1.<base64url(compact JSON: v=1, uidvalidity, uid)>
+```
+
+初次运行、旧格式、非法值、版本不支持、UIDVALIDITY 变化和 UID 回退都会建立
+安全 baseline 并返回 `reset=true`。正常轮询只搜索高水位线之后的 UID；邮件按 UID
+稳定排序和批量限制后转换为 `MailEnvelope`。正文使用 bounded MIME 解析，优先
+纯文本，必要时从 HTML 提取文本，排除附件并清洗控制字符。只有逐封幂等写入
+成功后，`mail_poller` 才推进 `next_cursor`。
+
+IMAP 错误只保留安全分类，例如配置、认证、协议、传输和超时错误，不包含授权码、
+邮件内容或 provider 原始响应。
+
+### 48.3.2 OpenAI-compatible LLM 适配器
+
+公开模块入口为：
+
+```text
+src/jobs_status_manager/infrastructure/adapters/openai_compatible_llm.py
+```
+
+该模块提供具体的同步 `LLMAdapter` 实现 `OpenAICompatibleLLM`。它拥有可复用的
+同步 HTTP client、base URL 到 `/chat/completions` 的规范化、请求与响应映射、由
+`JobMailAnalysisInput` schema 生成的邮件分析 prompt，以及由现有 Tool Registry
+投影出的 Conversation tools。邮件分析和 Conversation 响应都在适配器边界做
+严格校验；配置、认证、限流、provider 不可用、传输和 contract 错误只保留安全
+的 contract reason、HTTP 状态、受限 provider code 和 retry-after 等信息。
+
+适配器也处理 `finish_reason` 的契约边界，例如邮件分析被截断时按 `length`
+归类为 `truncated`，而不是把不完整结果交给业务层。它不访问数据库、不执行
+Tool、不创建 `PendingAction`，也不拥有 durable retry。Conversation 仍返回现有
+`ConversationResponse`，由 Conversation Agent 决定是否执行工具；写操作继续经过
+现有 `PendingAction` 和用户确认门控，不改变当前业务流程。
+
+邮件分析与 Conversation Agent 共用同一个 lifespan 级
+`OpenAICompatibleLLM` 实例和同步 `httpx2.Client`。base URL 必须由配置显式提供，
+使用 HTTPS，并由适配器规范化为 `/chat/completions`；模型固定为
+`deepseek-flash`，请求使用标准非流式 Chat Completions 形状。
+
+```text
+MailService ───────────────┐
+                           ├─ OpenAICompatibleLLM ── httpx2.Client
+Conversation Agent ────────┘
+```
+
+邮件分析要求响应为单个严格 JSON 对象，并在应用层校验
+`JobMailAnalysisInput`。Conversation 响应只能是一个最终文本答案，或恰好一个
+注册 Tool 的 function call；工具参数仍由现有 `TOOL_ARGUMENT_MODELS` 和
+`definitions()` 派生的 schema 约束。持久化的 `ToolCall`、`ToolResult` 和
+`PendingAction` 保留同一 `tool_call_id`，转换为 OpenAI-compatible tool message
+时不得丢失该关联。
+
+适配器只负责一次外部请求和响应解析，不负责业务重试。4xx/认证/配置错误为
+确定性终态；429、5xx、timeout、transport、malformed response 和 contract failure
+由邮件分析、Transactional Outbox 或 AgentRun 的持久化状态机按其重试策略处理。
+错误只输出安全的请求类型、HTTP 状态、受限 provider code 和 retry-after 等字段。
+
+### 48.3.3 适配器工厂、生命周期与 readiness
+
+`factory.py` 通过 capability-level 注入构造 IMAP、LLM、Embedding 和 Chroma。
+显式注入的实例优先于工厂构造，且不进入 factory-owned close 集合；工厂创建的
+LLM client 只关闭一次，IMAP 连接则属于单次 poll。邮件分析和 Conversation 使用
+同一 LLM identity，阻塞的同步 LLM/IMAP 调用继续通过现有 AnyIO worker thread
+执行。
+
+启动和关闭边界如下：
+
+```text
+Database
+  → create missing adapters
+  → validate production capabilities
+  → start QQ runtime and workers
+  → yield application
+  → cancel workers
+  → close QQ runtime
+  → close owned adapters
+  → dispose Database
+```
+
+`GET /health` 只读取数据库/schema 和内存 readiness，不触发 IMAP、LLM 或 QQ
+网络调用。local 且 IMAP/LLM 门控关闭时返回 `200` 与 `product_readiness=local_only`；
+production 缺少真实 IMAP/LLM 或使用 fake 时不得报告产品 ready。适配器本地契约、
+生命周期和 readiness 的当前验收记录见
+[`docs/imap-llm-adapter-verification.md`](./imap-llm-adapter-verification.md)，完整
+实现约束见 [`docs/imap-llm-adapter-implementation.md`](./imap-llm-adapter-implementation.md)。
+
+本轮适配器工作没有新增数据库 migration；当前数据库 head 仍为
+`0008_qq_reply_targets`。本地确定性测试不等同于 QQ 或 LLM provider 在线兼容性，
+此前已有一次真实 IMAP smoke，以及一次使用合成输入和响应验证真实 LLM 适配器
+边界的 smoke；这些有限证据不等同于完整的 provider 在线兼容性。真实 LLM
+endpoint 的持续调用、真实账号能力、完整邮件读取和其他生产 readiness gates，
+仍需单独的人批准验收，并保持与本地契约验证分开。
+
 ## 48.4 Application 匹配与规范化
 
 Application 同时保存展示字段和规范化字段：

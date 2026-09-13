@@ -36,6 +36,7 @@ from jobs_status_manager.mail import (
     ApplicationSuggestion,
     JobMailAnalysisInput,
     MailEnvelope,
+    MailPollBatch,
     MailType,
     StatusSuggestion,
 )
@@ -107,7 +108,7 @@ def _poll(setup: PipelineSetup, message: MailEnvelope) -> None:
     poll_once(
         setup.services,
         setup.identity.mail_account_id,
-        FakeIMAPGateway(messages=[message]),
+        FakeIMAPGateway(messages=[message], next_cursor=f"cursor-{message.provider_message_id}"),
     )
 
 
@@ -116,15 +117,15 @@ def test_poll_passes_cursor_and_counts_only_new_mail(
 ) -> None:
     setup = _setup(database, settings, fake_clock)
     message = _envelope("m-cursor", "application received", "申请已收到")
-    first_gateway = FakeIMAPGateway(messages=[message])
+    first_gateway = FakeIMAPGateway(messages=[message], next_cursor="cursor-1")
     first = poll_once(setup.services, setup.identity.mail_account_id, first_gateway)
-    second_gateway = FakeIMAPGateway(messages=[message])
+    second_gateway = FakeIMAPGateway(messages=[message], next_cursor="cursor-2")
     second = poll_once(setup.services, setup.identity.mail_account_id, second_gateway)
 
     assert first.ingested == 1
     assert second.ingested == 0
     assert first_gateway.calls == [("poll", ("test-account", ""))]
-    assert second_gateway.calls == [("poll", ("test-account", "m-cursor"))]
+    assert second_gateway.calls == [("poll", ("test-account", "cursor-1"))]
 
 
 def test_poll_failure_keeps_cursor_and_records_error(
@@ -135,7 +136,7 @@ def test_poll_failure_keeps_cursor_and_records_error(
     poll_once(
         setup.services,
         setup.identity.mail_account_id,
-        FakeIMAPGateway(messages=[message]),
+        FakeIMAPGateway(messages=[message], next_cursor="cursor-before-failure"),
     )
     failed = poll_once(
         setup.services,
@@ -151,7 +152,7 @@ def test_poll_failure_keeps_cursor_and_records_error(
             ),
             {"account_id": setup.identity.mail_account_id},
         ).one()
-        assert row.polling_cursor == "m-before-failure"
+        assert row.polling_cursor == "cursor-before-failure"
         assert row.polling_last_error == safe_external_error(RuntimeError("imap unavailable"))
 
 
@@ -175,6 +176,30 @@ def test_ingestion_is_idempotent_and_non_job_stops(
         )
         assert connection.execute(text("SELECT COUNT(*) FROM job_mail_analyses")).scalar_one() == 0
         assert connection.execute(text("SELECT COUNT(*) FROM notifications")).scalar_one() == 0
+
+
+def test_empty_reset_batch_advances_explicit_cursor(
+    database: Database, settings: AppSettings, fake_clock: FakeClock
+) -> None:
+    setup = _setup(database, settings, fake_clock)
+
+    result = poll_once(
+        setup.services,
+        setup.identity.mail_account_id,
+        FakeIMAPGateway(
+            batch=MailPollBatch(envelopes=(), next_cursor="baseline-cursor", reset=True)
+        ),
+    )
+
+    assert result == type(result)(ingested=0, failed=False)
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT polling_cursor FROM mail_accounts WHERE id=:account_id"),
+                {"account_id": setup.identity.mail_account_id},
+            ).scalar_one()
+            == "baseline-cursor"
+        )
 
 
 def test_ordinary_job_mail_reaches_qq_once(

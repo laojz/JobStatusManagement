@@ -80,34 +80,44 @@ Phase 6 operations and deployment are documented in
 [`docs/operations.md`](docs/operations.md), [`docs/deployment.md`](docs/deployment.md),
 and [`docs/phase-6-verification.md`](docs/phase-6-verification.md).
 
-## Current QQ Adapter Acceptance Snapshot
+## Current IMAP and LLM Adapter Acceptance Snapshot
 
-本轮确定性验收（2026-09-12）已完成 QQ botpy 适配器的本地实现验证：
+本轮验收（2026-09-13）完成了 QQ IMAP、OpenAI-compatible
+`deepseek-flash` LLM 以及生命周期/readiness 接线的有限路径验证：
 
 ```text
 qq-botpy-sdk==2.0.4
-uv run pytest -q                         267 passed in 8.28s
+uv run pytest -q tests/unit/test_openai_compatible_llm.py
+                                           PASS: 31 passed
+uv run pytest -q                         373 passed; 2 pre-existing readiness assertion failures, unrelated to adapter changes
 uv run ruff check .                      PASS
-uv run ruff format --check .             PASS (166 files)
+uv run ruff format --check .             PASS (180 files)
 uv run basedpyright                      0 errors, 0 warnings, 0 notes
 uv lock --check                          PASS
-uv run alembic check                     PASS
+uv run alembic check                     PASS (no new upgrade operations detected)
+uv run alembic current                   PASS: 0008_qq_reply_targets (head)
 git diff --check                         PASS
-current database head                    0008_qq_reply_targets (head)
+schema migration added by this work      none
+changed Python file LSP diagnostics      PASS: no diagnostics
 ```
 
-同时验证了 webhook durable ACK、事件幂等、C2C reply target 持久化重建、
-出站结果分类、附件 SSRF/重定向/deadline/文件头校验、`.part` 清理和安全错误
-脱敏。当前本地 `.env` 已确认包含 App ID、App Secret、测试 user openid 和
-显式 Token URL，但 `APP_QQ_ENABLED=false`，因此本地运行不会启动真实 botpy。
+同时验证了 IMAP cursor/MIME/UID poll、LLM strict parsing 和 typed errors、
+tool_call_id 透传、LLM client ownership、factory/lifecycle shutdown、health readiness、
+durable retry 和现有 QQ webhook/附件安全边界。LLM 邮件分析 prompt 包含生成的 schema，
+并执行 strict validation。正常 logout/shutdown 后只忽略 plain `OSError(errno.EBADF)`。
 
-以下项目仍未通过真实 QQ 平台验收，必须保持 `BLOCKED`：API/token endpoint
-访问与刷新、URL challenge、C2C 接收/回复、主动推送、附件接收下载、普通
-文件/图片发送、ambiguous outcome 处理和真实重启恢复。本轮没有发起真实 QQ
-endpoint 请求，也没有宣称生产兼容性。完整证据见
-`.omo/evidence/task-8-qq-botpy-sdk-adapter.md`，实现基线见
-[`docs/architecture.md`](docs/architecture.md) 和
-[`docs/qq-botpy-adapter-design.md`](docs/qq-botpy-adapter-design.md)。
+有限 smoke 证据包括：之前执行的真实 QQ IMAP adapter smoke 已通过，覆盖登录、poll
+和 cleanup 路径；一次 synthetic-input real LLM smoke 已通过，使用真实 LLM adapter 和
+合成邮件输入验证请求、真实 provider 响应解析、contract reason 分类及 strict validation
+路径。这些只是有限的已
+执行路径结果，不代表完整的 provider compatibility 或 production readiness。
+
+以下项目仍必须保持 `BLOCKED`/human-gated：QQ token/API endpoint、URL challenge、
+C2C 收发、主动推送、附件/文件/图片能力、ambiguous outcome 处理和真实在线重启恢复。
+完整当前证据见
+[`docs/imap-llm-adapter-verification.md`](docs/imap-llm-adapter-verification.md)，
+实现基线见 [`docs/imap-llm-adapter-implementation.md`](docs/imap-llm-adapter-implementation.md)
+和 [`docs/architecture.md`](docs/architecture.md)。
 
 Run the complete verification suite with:
 

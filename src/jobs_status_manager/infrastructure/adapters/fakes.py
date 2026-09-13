@@ -11,7 +11,7 @@ from jobs_status_manager.agent.contracts import (
     ReplyTarget,
 )
 from jobs_status_manager.knowledge.contracts import VectorHit, VectorRecord
-from jobs_status_manager.mail import JobMailAnalysisInput, MailEnvelope
+from jobs_status_manager.mail import JobMailAnalysisInput, MailEnvelope, MailPollBatch
 
 
 class FakeConfigurationError(RuntimeError):
@@ -45,14 +45,8 @@ class RecordingFake:
 class FakeLLM(RecordingFake):
     """Deterministic LLM fake."""
 
-    response: str = ""
     analysis: JobMailAnalysisInput | None = None
     conversation_responses: list[ConversationResponse] = field(default_factory=list)
-
-    def complete(self, prompt: str) -> str:
-        """Record a completion and return the configured response."""
-        self.record("complete", prompt)
-        return self.response
 
     def analyze_job_mail(self, prompt: str) -> JobMailAnalysisInput:
         """Record and return a configured typed analysis."""
@@ -153,11 +147,16 @@ class FakeIMAPGateway(RecordingFake):
     """Deterministic IMAP fake."""
 
     messages: list[MailEnvelope] = field(default_factory=list)
+    next_cursor: str = "fake-cursor"
+    reset: bool = False
+    batch: MailPollBatch | None = None
 
-    def poll(self, account_key: str, cursor: str | None) -> list[MailEnvelope]:
+    def poll(self, account_key: str, cursor: str | None) -> MailPollBatch:
         """Record a poll and return configured messages."""
         self.record("poll", account_key, cursor or "")
-        return list(self.messages)
+        if self.batch is not None:
+            return self.batch
+        return MailPollBatch(tuple(self.messages), self.next_cursor, self.reset)
 
 
 @dataclass(frozen=True, slots=True)

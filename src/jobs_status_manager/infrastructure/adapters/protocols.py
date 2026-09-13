@@ -10,15 +10,11 @@ from jobs_status_manager.agent.contracts import (
     ReplyTarget,
 )
 from jobs_status_manager.knowledge.contracts import VectorHit, VectorRecord
-from jobs_status_manager.mail import JobMailAnalysisInput, MailEnvelope
+from jobs_status_manager.mail import JobMailAnalysisInput, MailPollBatch
 
 
 class LLMAdapter(Protocol):
     """Language model boundary."""
-
-    def complete(self, prompt: str) -> str:
-        """Complete a prompt for legacy callers."""
-        ...
 
     def analyze_job_mail(self, prompt: str) -> JobMailAnalysisInput:
         """Return a validated job-mail analysis."""
@@ -91,7 +87,7 @@ class QQGateway(Protocol):
 class IMAPGateway(Protocol):
     """IMAP polling boundary."""
 
-    def poll(self, account_key: str, cursor: str | None) -> list[MailEnvelope]:
+    def poll(self, account_key: str, cursor: str | None) -> MailPollBatch:
         """Poll an account after its persisted high-watermark."""
         ...
 

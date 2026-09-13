@@ -18,6 +18,7 @@ from jobs_status_manager.event_consumers import (
     consume_job_analyzed,
     consume_mail_received,
 )
+from jobs_status_manager.infrastructure.adapters._openai_compatible_llm_types import LLMError
 from jobs_status_manager.infrastructure.database.transactions import transaction
 from jobs_status_manager.infrastructure.safe_errors import safe_external_error
 
@@ -64,7 +65,8 @@ def publish_once(services: EventServices, max_attempts: int = MAX_OUTBOX_ATTEMPT
                 if event is not None:
                     event.attempt_count += 1
                     event.last_error = safe_external_error(error)
-                    if event.attempt_count >= max_attempts:
+                    terminal = isinstance(error, LLMError) and not error.retryable
+                    if terminal or event.attempt_count >= max_attempts:
                         event.status = OutboxStatus.FAILED.value
                         event.next_attempt_at = None
                     else:

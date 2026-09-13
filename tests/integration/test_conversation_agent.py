@@ -706,6 +706,25 @@ def test_registry_exposes_phase_five_tools_with_confirmation_gated_writes() -> N
         definition for definition in definitions() if definition.name == "UpdateApplicationStatus"
     )
     assert write_definition.requires_confirmation is True
+    assert write_definition.input_schema["additionalProperties"] is False
+    assert write_definition.input_schema["properties"]["company"]["minLength"] == 1
+    assert (
+        write_definition.input_schema["properties"]["interview_round"]["anyOf"][0][
+            "exclusiveMinimum"
+        ]
+        == 0
+    )
+    assert write_definition.input_schema["$defs"]["ApplicationStatus"]["enum"] == [
+        "APPLIED",
+        "SCREENING",
+        "ASSESSMENT",
+        "INTERVIEW",
+        "HR_INTERVIEW",
+        "OFFER",
+        "OFFER_ACCEPTED",
+        "REJECTED",
+        "TERMINATED",
+    ]
 
 
 def test_runtime_rejects_ninth_tool_and_forbidden_write(

@@ -22,11 +22,16 @@ class HealthPayload(TypedDict):
     durable_tasks: str
     failed_tasks: int
     stale_tasks: int
+    runtime_mode: str
+    imap: str
+    llm: str
+    product_readiness: str
 
 
 def health(request: Request) -> Response:
     """Return readiness and schema status without business data."""
     database = request.state.database
+    readiness = request.state.readiness
     database_status = "ok"
     schema_version: str | None = None
     try:
@@ -44,7 +49,8 @@ def health(request: Request) -> Response:
         tasks = list_tasks(database, include_stale=True)
         failed_tasks = sum(not task.stale for task in tasks)
         stale_tasks = sum(task.stale for task in tasks)
-    ready = database_status == "ok" and schema_version is not None
+    external_ready = readiness["product_readiness"] in {"ready", "local_only"}
+    ready = database_status == "ok" and schema_version is not None and external_ready
     durable_tasks = "degraded" if failed_tasks or stale_tasks else "ok"
     payload: HealthPayload = {
         "status": "ready" if ready else "not_ready",
@@ -55,5 +61,9 @@ def health(request: Request) -> Response:
         "durable_tasks": durable_tasks,
         "failed_tasks": failed_tasks,
         "stale_tasks": stale_tasks,
+        "runtime_mode": readiness["runtime_mode"],
+        "imap": readiness["imap"],
+        "llm": readiness["llm"],
+        "product_readiness": readiness["product_readiness"] if ready else "not_ready",
     }
     return JSONResponse(payload, status_code=200 if ready else 503)

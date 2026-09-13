@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from jobs_status_manager.application_core.domain import EventType, OutboxStatus
 from jobs_status_manager.application_core.models import OutboxEvent
+from jobs_status_manager.infrastructure.adapters._openai_compatible_llm_types import LLMError
 from jobs_status_manager.infrastructure.database.transactions import transaction
 from jobs_status_manager.infrastructure.safe_errors import safe_external_error
 from jobs_status_manager.mail import (
@@ -151,7 +152,8 @@ def analyze_mail(
     try:
         analysis = llm.analyze_job_mail(prompt)
     except (RuntimeError, ValidationError) as error:
-        mark_analysis_failure(services, mail_id, safe_external_error(error))
+        retryable = not isinstance(error, LLMError) or error.retryable
+        mark_analysis_failure(services, mail_id, safe_external_error(error), retryable=retryable)
         raise
     return persist_analysis(services, mail_id, analysis, effective_metadata, marker)
 
@@ -223,15 +225,19 @@ def _add_marker(services: MailServices, session: Session, marker: ConsumerMarker
         )
 
 
-def mark_analysis_failure(services: MailServices, mail_id: str, error: str) -> None:
+def mark_analysis_failure(
+    services: MailServices, mail_id: str, error: str, *, retryable: bool = True
+) -> None:
     """Persist bounded retry state after an analysis failure."""
     with transaction(services.database) as session:
         mail = session.get(Mail, mail_id)
         if mail is None:
             return
         now = services.clock.now()
-        mail.processing_state = AnalysisState.RETRY_WAIT.value
+        mail.processing_state = (
+            AnalysisState.RETRY_WAIT.value if retryable else AnalysisState.FAILED.value
+        )
         mail.attempt_count += 1
         mail.last_error = error[:2000]
-        mail.next_retry_at = now + timedelta(minutes=5)
+        mail.next_retry_at = now + timedelta(minutes=5) if retryable else None
         mail.updated_at = now

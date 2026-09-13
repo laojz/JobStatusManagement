@@ -6,10 +6,13 @@ from pydantic import SecretStr
 
 from jobs_status_manager.config.settings import AppSettings
 from jobs_status_manager.infrastructure.adapters.factory import (
+    AdapterCapabilities,
     AdapterConfigurationError,
     OwnedAdapters,
     create_owned_adapters,
 )
+from jobs_status_manager.infrastructure.adapters.fakes import FakeIMAPGateway, FakeLLM
+from jobs_status_manager.infrastructure.adapters.qq_imap import QQIMAPConfig
 
 
 def _settings(
@@ -154,3 +157,111 @@ def test_factory_preserves_construction_error_when_embedding_close_fails(
 
     assert str(raised.value) == "construction-secret-value"
     assert "cleanup-secret-value" not in str(raised.value)
+
+
+def test_factory_constructs_shared_production_capabilities_and_closes_owned_clients(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    close_calls: list[str] = []
+
+    class FakeLLM:
+        def __init__(self, *args: str, **kwargs: str) -> None:
+            pass
+
+        def close(self) -> None:
+            close_calls.append("llm")
+
+    class FakeIMAP:
+        def __init__(self, config: QQIMAPConfig) -> None:
+            assert config.account == "imap@example.com"
+
+    class FakeEmbedding:
+        def __init__(self, api_key: SecretStr) -> None:
+            pass
+
+        def close(self) -> None:
+            close_calls.append("embedding")
+
+    class FakeChroma:
+        def __init__(self, path: Path) -> None:
+            assert path == tmp_path
+
+    monkeypatch.setattr(
+        "jobs_status_manager.infrastructure.adapters.factory.OpenAICompatibleLLM",
+        FakeLLM,
+    )
+    monkeypatch.setattr(
+        "jobs_status_manager.infrastructure.adapters.factory.QQIMAPGateway",
+        FakeIMAP,
+    )
+    monkeypatch.setattr(
+        "jobs_status_manager.infrastructure.adapters.factory.BailianEmbedding",
+        FakeEmbedding,
+    )
+    monkeypatch.setattr(
+        "jobs_status_manager.infrastructure.adapters.factory.LocalChroma",
+        FakeChroma,
+    )
+
+    resources = create_owned_adapters(
+        _settings(
+            embedding_api_key=SecretStr("embedding-secret"),
+            chroma_path=tmp_path,
+        ).model_copy(
+            update={
+                "imap_enabled": True,
+                "imap_account": "imap@example.com",
+                "imap_auth_code": SecretStr("imap-secret"),
+                "llm_enabled": True,
+                "llm_base_url": "https://llm.example.invalid/v1",
+                "llm_api_key": SecretStr("llm-secret"),
+            }
+        )
+    )
+
+    assert isinstance(resources, OwnedAdapters)
+    assert resources.imap is not None
+    assert resources.llm is not None
+    assert resources.embedding is not None
+    assert resources.chroma is not None
+    resources.close()
+    resources.close()
+    assert close_calls == ["embedding", "llm"]
+
+
+def test_factory_preserves_supplied_capabilities_without_constructing_or_closing_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supplied = AdapterCapabilities(imap=FakeIMAPGateway(), llm=FakeLLM())
+
+    def unexpected_factory(*args: str, **kwargs: str) -> Never:
+        raise AssertionError
+
+    monkeypatch.setattr(
+        "jobs_status_manager.infrastructure.adapters.factory.QQIMAPGateway",
+        unexpected_factory,
+    )
+    monkeypatch.setattr(
+        "jobs_status_manager.infrastructure.adapters.factory.OpenAICompatibleLLM",
+        unexpected_factory,
+    )
+
+    resources = create_owned_adapters(
+        _settings().model_copy(
+            update={
+                "imap_enabled": True,
+                "imap_account": "imap@example.com",
+                "imap_auth_code": SecretStr("imap-secret"),
+                "llm_enabled": True,
+                "llm_base_url": "https://llm.example.invalid/v1",
+                "llm_api_key": SecretStr("llm-secret"),
+            }
+        ),
+        supplied,
+    )
+
+    assert resources is not None
+    assert resources.imap is supplied.imap
+    assert resources.llm is supplied.llm
+    resources.close()

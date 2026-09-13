@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import select
@@ -103,11 +104,14 @@ def process_run(services: RuntimeServices, run_id: str) -> None:
         if command.resolution is not None:
             _process_confirmation(services, context, command.resolution)
             return
-        answer, error = run_turns(services, context)
+        answer, error, retryable = run_turns(services, context)
         with transaction(services.database) as session:
             run = session.get(AgentRun, context.run_id)
             if run is not None and run.state == AgentRunState.WAITING_USER_CONFIRMATION.value:
                 return
+        if answer is None and error is not None and retryable:
+            _schedule_run_retry(services, context, error)
+            return
     if answer is not None:
         if route_command(context.user_message).resolution is not None:
             _deliver_command_answer(services, context, answer)
@@ -150,6 +154,15 @@ def _prepare_run_attempt(services: RuntimeServices, run_id: str) -> bool:
             run.attempt_count += 1
             run.next_retry_at = None
         return True
+
+
+def _schedule_run_retry(services: RuntimeServices, context: RunContext, error: str) -> None:
+    with transaction(services.database) as session:
+        run = session.get(AgentRun, context.run_id)
+        if run is not None:
+            run.state = AgentRunState.DELIVERY_PENDING.value
+            run.error = error
+            run.next_retry_at = services.clock.now() + timedelta(minutes=5)
 
 
 def _deliver_answer(services: RuntimeServices, context: RunContext, answer: str) -> None:

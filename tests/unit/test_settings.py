@@ -373,3 +373,218 @@ def test_qq_production_urls_reject_http(field: str) -> None:
 
     with pytest.raises(ValidationError, match="must use https"):
         AppSettings(**values)
+
+
+@pytest.mark.parametrize("field", ["imap_auth_code", "llm_api_key"])
+@pytest.mark.parametrize("blank_value", ["", "   ", "\t\n"])
+def test_blank_external_secrets_become_none(field: str, blank_value: str) -> None:
+    values = {
+        "_env_file": None,
+        "database_path": Path("database.sqlite3"),
+        "data_dir": Path("data"),
+        "bootstrap_user_external_key": "user-key",
+        "bootstrap_user_display_name": "User",
+        "bootstrap_mail_provider": "local",
+        "bootstrap_mail_account_key": "account-key",
+        "bootstrap_mail_display_name": "Mailbox",
+        "qq_user_openid": "openid",
+        field: blank_value,
+    }
+
+    settings = AppSettings(**values)
+
+    assert getattr(settings, field) is None
+
+
+def test_external_defaults_and_nonblank_secrets_are_typed() -> None:
+    settings = AppSettings(
+        _env_file=None,
+        database_path=Path("database.sqlite3"),
+        data_dir=Path("data"),
+        bootstrap_user_external_key="user-key",
+        bootstrap_user_display_name="User",
+        bootstrap_mail_provider="local",
+        bootstrap_mail_account_key="account-key",
+        bootstrap_mail_display_name="Mailbox",
+        qq_user_openid="openid",
+        imap_auth_code="imap-code-placeholder",
+        llm_api_key="llm-key-placeholder",
+    )
+
+    assert settings.runtime_mode == "local"
+    assert settings.imap_enabled is False
+    assert settings.llm_enabled is False
+    assert settings.imap_auth_code == SecretStr("imap-code-placeholder")
+    assert settings.llm_api_key == SecretStr("llm-key-placeholder")
+    assert settings.imap_host == "imap.qq.com"
+    assert settings.imap_port == 993
+    assert settings.imap_ssl is True
+    assert settings.imap_folder == "INBOX"
+    assert settings.llm_model == "deepseek-flash"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("imap_account", None), ("imap_auth_code", None)],
+)
+def test_enabled_imap_requires_account_and_auth_code(field: str, value: str | None) -> None:
+    values = {
+        "_env_file": None,
+        "database_path": Path("database.sqlite3"),
+        "data_dir": Path("data"),
+        "bootstrap_user_external_key": "user-key",
+        "bootstrap_user_display_name": "User",
+        "bootstrap_mail_provider": "local",
+        "bootstrap_mail_account_key": "account-key",
+        "bootstrap_mail_display_name": "Mailbox",
+        "qq_user_openid": "openid",
+        "imap_enabled": True,
+        "imap_account": "imap@example.com",
+        "imap_auth_code": "imap-code-placeholder",
+    }
+    values[field] = value
+
+    with pytest.raises(ValidationError, match="imap_enabled requires"):
+        AppSettings(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("imap_host", "imap.example.invalid"),
+        ("imap_port", 994),
+        ("imap_ssl", False),
+        ("imap_folder", "Archive"),
+    ],
+)
+def test_imap_fixed_constraints_are_enforced(field: str, value: str | int | bool) -> None:
+    values = {
+        "_env_file": None,
+        "database_path": Path("database.sqlite3"),
+        "data_dir": Path("data"),
+        "bootstrap_user_external_key": "user-key",
+        "bootstrap_user_display_name": "User",
+        "bootstrap_mail_provider": "local",
+        "bootstrap_mail_account_key": "account-key",
+        "bootstrap_mail_display_name": "Mailbox",
+        "qq_user_openid": "openid",
+        field: value,
+    }
+
+    with pytest.raises(ValidationError):
+        AppSettings(**values)
+
+
+@pytest.mark.parametrize("value", [0, -1, 501])
+def test_imap_batch_size_is_bounded(value: int) -> None:
+    with pytest.raises(ValidationError, match="between 1 and 500"):
+        AppSettings(
+            _env_file=None,
+            database_path=Path("database.sqlite3"),
+            data_dir=Path("data"),
+            bootstrap_user_external_key="user-key",
+            bootstrap_user_display_name="User",
+            bootstrap_mail_provider="local",
+            bootstrap_mail_account_key="account-key",
+            bootstrap_mail_display_name="Mailbox",
+            qq_user_openid="openid",
+            imap_batch_size=value,
+        )
+
+
+def test_enabled_llm_requires_https_endpoint_and_api_key() -> None:
+    with pytest.raises(ValidationError, match="llm_enabled requires"):
+        AppSettings(
+            _env_file=None,
+            database_path=Path("database.sqlite3"),
+            data_dir=Path("data"),
+            bootstrap_user_external_key="user-key",
+            bootstrap_user_display_name="User",
+            bootstrap_mail_provider="local",
+            bootstrap_mail_account_key="account-key",
+            bootstrap_mail_display_name="Mailbox",
+            qq_user_openid="openid",
+            llm_enabled=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("llm_base_url", "http://llm.example.invalid", "must use https"),
+        ("llm_model", "deepseek-chat", "deepseek-flash"),
+    ],
+)
+def test_llm_fixed_constraints_are_enforced(field: str, value: str, message: str) -> None:
+    values = {
+        "_env_file": None,
+        "database_path": Path("database.sqlite3"),
+        "data_dir": Path("data"),
+        "bootstrap_user_external_key": "user-key",
+        "bootstrap_user_display_name": "User",
+        "bootstrap_mail_provider": "local",
+        "bootstrap_mail_account_key": "account-key",
+        "bootstrap_mail_display_name": "Mailbox",
+        "qq_user_openid": "openid",
+        "llm_api_key": "llm-key-placeholder",
+        field: value,
+    }
+
+    with pytest.raises(ValidationError, match=message):
+        AppSettings(**values)
+
+
+def test_llm_pool_keepalive_limit_cannot_exceed_connections() -> None:
+    with pytest.raises(ValidationError, match="must not exceed"):
+        AppSettings(
+            _env_file=None,
+            database_path=Path("database.sqlite3"),
+            data_dir=Path("data"),
+            bootstrap_user_external_key="user-key",
+            bootstrap_user_display_name="User",
+            bootstrap_mail_provider="local",
+            bootstrap_mail_account_key="account-key",
+            bootstrap_mail_display_name="Mailbox",
+            qq_user_openid="openid",
+            llm_max_connections=1,
+            llm_max_keepalive_connections=2,
+        )
+
+
+def test_production_requires_both_external_gates() -> None:
+    with pytest.raises(ValidationError, match="production requires"):
+        AppSettings(
+            _env_file=None,
+            database_path=Path("database.sqlite3"),
+            data_dir=Path("data"),
+            bootstrap_user_external_key="user-key",
+            bootstrap_user_display_name="User",
+            bootstrap_mail_provider="local",
+            bootstrap_mail_account_key="account-key",
+            bootstrap_mail_display_name="Mailbox",
+            qq_user_openid="openid",
+            runtime_mode="production",
+        )
+
+
+def test_legacy_imap_password_environment_name_is_rejected_safely(
+    monkeypatch: MonkeyPatch,
+) -> None:
+    legacy_value = "legacy-password-placeholder"
+    monkeypatch.setenv("APP_IMAP_PASSWORD", legacy_value)
+
+    with pytest.raises(ValidationError) as raised:
+        AppSettings(
+            _env_file=None,
+            database_path=Path("database.sqlite3"),
+            data_dir=Path("data"),
+            bootstrap_user_external_key="user-key",
+            bootstrap_user_display_name="User",
+            bootstrap_mail_provider="local",
+            bootstrap_mail_account_key="account-key",
+            bootstrap_mail_display_name="Mailbox",
+            qq_user_openid="openid",
+        )
+
+    safe_error = safe_settings_error(raised.value)
+    assert legacy_value not in safe_error

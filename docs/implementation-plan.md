@@ -6,22 +6,25 @@
 
 ## Current Verification Status
 
-截至 2026-09-12，QQ botpy 适配器的确定性本地实现已完成并通过当前工作树验收：
+截至 2026-09-12，QQ IMAP、OpenAI-compatible `deepseek-flash` LLM 适配器及其
+factory/lifecycle/readiness 接线的确定性本地实现已完成并通过当前工作树验收：
 
 ```text
 qq-botpy-sdk==2.0.4
-full suite: 267 passed in 8.28s
+full suite: 337 passed in 9.03s
 Ruff / format / basedpyright / uv lock / Alembic / diff checks: PASS
 Alembic head: 0008_qq_reply_targets (head)
+schema migration added by adapter work: none
 ```
 
-该结果覆盖自定义 Webhook transport、持久化后 ACK、重复事件幂等、C2C
-ReplyTarget 重建、同步到异步发送桥、附件安全边界和出站错误分类。它不等同
-于真实 QQ 兼容性验收：token/API endpoint、URL challenge、C2C 收发、附件、
-普通文件/图片、ambiguous provider outcome 和真实重启恢复仍为 human-gated
-`BLOCKED`。历史 Phase 6 的 `120 tests` 结果继续保留为当时的阶段快照，不与
-当前完整套件计数混用。可复核证据见
-[`../.omo/evidence/task-8-qq-botpy-sdk-adapter.md`](../.omo/evidence/task-8-qq-botpy-sdk-adapter.md)。
+该结果覆盖 IMAP cursor/MIME/UID poll、LLM strict parsing、tool_call_id 透传、
+typed errors、client ownership、factory/lifecycle/readiness、durable retry，以及
+既有 QQ webhook transport、持久化后 ACK、事件幂等、C2C ReplyTarget 重建、附件
+安全边界和出站错误分类。它不等同于真实 QQ 或 LLM 兼容性验收：真实 IMAP 登录、
+LLM endpoint、QQ token/API、URL challenge、C2C 收发、附件/文件/图片、ambiguous
+provider outcome 和在线重启恢复仍为 human-gated `BLOCKED`。历史 Phase 6 的
+`120 tests` 结果继续保留为当时的阶段快照，不与当前完整套件计数混用。可复核
+证据见 [`./imap-llm-adapter-verification.md`](./imap-llm-adapter-verification.md)。
 
 ## 0. Implementation Principles
 

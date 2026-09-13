@@ -25,6 +25,7 @@ from jobs_status_manager.agent.write_runtime import (
     propose_agent_write,
     record_confirmation_delivery,
 )
+from jobs_status_manager.infrastructure.adapters._openai_compatible_llm_types import LLMError
 from jobs_status_manager.infrastructure.safe_errors import safe_external_error
 
 if TYPE_CHECKING:
@@ -55,10 +56,10 @@ def _next_response(
     context: RunContext,
     tool_results: list[PromptToolResult],
     started: float,
-) -> tuple[ConversationResponse | None, str | None]:
+) -> tuple[ConversationResponse | None, str | None, bool]:
     remaining = services.max_run_seconds - (time.monotonic() - started)
     if remaining <= 0:
-        return None, "agent run exceeded time limit"
+        return None, "agent run exceeded time limit", False
     try:
         response = _converse(
             services,
@@ -75,8 +76,9 @@ def _next_response(
             remaining,
         )
     except (RuntimeError, ValueError, TimeoutError) as exception:
-        return None, safe_external_error(exception)
-    return response, None
+        retryable = isinstance(exception, LLMError) and exception.retryable
+        return None, safe_external_error(exception), retryable
+    return response, None, False
 
 
 def _with_results(
@@ -144,7 +146,13 @@ def _resume_pending_tool(
     )
     if result is None:
         return context, error
-    tool_results.append(PromptToolResult(data=result.data, context_refs=result.context_refs))
+    tool_results.append(
+        PromptToolResult(
+            tool_call_id=context.pending_tool_call_id,
+            data=result.data,
+            context_refs=result.context_refs,
+        )
+    )
     return _with_results(services.database, context, tool_results), None
 
 
@@ -216,22 +224,26 @@ def _execute_requested_tool(
 def run_turns(
     services: RuntimeServices,
     context: RunContext,
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, bool]:
     """Run a bounded sequence of LLM responses and persisted tool calls."""
     started = time.monotonic()
     context = update_active_context(services.database, context)
     tool_results = list(context.tool_results)
     context, tool_error, suspended = _resume_before_turns(services, context, tool_results)
     if tool_error is not None:
-        return None, tool_error
+        return None, tool_error, False
     if suspended:
-        return None, None
+        return None, None, False
     answer: str | None = None
     error: str | None = None
+    retryable = False
     for sequence in range(context.next_sequence, services.max_tool_calls + 1):
-        response, response_error = _next_response(services, context, tool_results, started)
+        response, response_error, response_retryable = _next_response(
+            services, context, tool_results, started
+        )
         if response is None:
             error = response_error
+            retryable = response_retryable
             break
         if response.answer is not None:
             answer = response.answer
@@ -256,10 +268,20 @@ def run_turns(
         if suspended:
             if result is not None and result.confirmation_prompt is not None:
                 _deliver_confirmation_prompt(services, context, result.confirmation_prompt)
-            return None, None
+            return None, None, False
         if result is None:
             error = tool_error
             break
-        tool_results.append(PromptToolResult(data=result.data, context_refs=result.context_refs))
+        tool_results.append(
+            PromptToolResult(
+                tool_call_id=call_id,
+                data=result.data,
+                context_refs=result.context_refs,
+            )
+        )
         context = _with_results(services.database, context, tool_results)
-    return answer, error or (None if answer is not None else "agent run exceeded tool-call limit")
+    return (
+        answer,
+        error or (None if answer is not None else "agent run exceeded tool-call limit"),
+        retryable if error is not None else False,
+    )
