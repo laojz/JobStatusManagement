@@ -1,6 +1,6 @@
 # Configuration
 
-Settings use the `APP_` prefix and load `.env` from the working directory. Unknown settings are rejected. Required local fields are:
+Settings use the `APP_` prefix and load `.env` from the working directory when the application starts. Unknown settings are rejected. Tests and CI must select their environment source explicitly rather than relying on a working-directory `.env`. Required local fields are:
 
 - `APP_DATABASE_PATH`
 - `APP_DATA_DIR`
@@ -44,3 +44,19 @@ Starlette listener binds through `APP_HOST` and `APP_PORT`; the QQ route uses
 `APP_QQ_WEBHOOK_PATH`.
 
 Use `chmod 600 .env` and `chmod 700 ./data ./backups`. Credentials are opaque optional settings, never logged or persisted as plaintext identity fields. A non-empty `APP_EMBEDDING_API_KEY` requires `APP_CHROMA_PATH` for production indexing and rebuilds. An empty or missing key disables production indexing even when the default Chroma path remains configured. `APP_EMBEDDING_API_KEY` is sent only as a Bearer credential to Alibaba Cloud Bailian.
+
+## Migration target
+
+Direct Alembic commands do not load `.env` and do not have a repository-local
+database fallback. Set the same database path used by the application before
+running `check`, `current`, or `upgrade`:
+
+```bash
+APP_DATABASE_PATH=./data/jobs_status.db uv run alembic check
+APP_DATABASE_PATH=./data/jobs_status.db uv run alembic current
+APP_DATABASE_PATH=./data/jobs_status.db uv run alembic upgrade head
+```
+
+The application CLI loads `.env` through `AppSettings`; the direct Alembic
+contract requires `APP_DATABASE_PATH` explicitly so a migration check cannot
+silently create a separate `jobs_status_alembic.db` file.

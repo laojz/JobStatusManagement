@@ -53,7 +53,7 @@ provider ID 或 Authorization 数据。
 | Command | Result |
 | --- | --- |
 | `uv run pytest -q tests/unit/test_openai_compatible_llm.py` | PASS: 31 passed |
-| `uv run pytest -q` | 373 passed; 2 pre-existing readiness assertion failures, unrelated to the adapter fixes |
+| `uv run pytest -q` | **Recorded pre-fix baseline:** 373 passed; 2 readiness assertion failures |
 | `uv run ruff check .` | PASS |
 | `uv run ruff format --check .` | PASS: 180 files already formatted |
 | `uv run basedpyright` | PASS: 0 errors, 0 warnings, 0 notes |

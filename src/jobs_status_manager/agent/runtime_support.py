@@ -15,6 +15,7 @@ from jobs_status_manager.agent.contracts import (
     PromptToolResult,
     ReplyMode,
     ReplyTarget,
+    ReplyTargetError,
 )
 from jobs_status_manager.agent.models import AgentRun, ConversationMessage, ToolCall, ToolResult
 from jobs_status_manager.agent.models import Session as AgentSession
@@ -35,6 +36,7 @@ __all__ = [
     "load_context",
     "persist_tool_call",
     "persist_tool_error",
+    "reply_target_from_message",
     "update_active_context",
 ]
 
@@ -62,6 +64,35 @@ class RunContext:
     final_message_content: str | None
     state: str
     reply_target: ReplyTarget | None = None
+
+
+def reply_target_from_message(message: ConversationMessage) -> ReplyTarget | None:
+    """Reconstruct a passive target or reject incomplete persisted metadata."""
+    target_fields = (
+        message.provider_name,
+        message.provider_scope,
+        message.provider_target_id,
+        message.provider_message_id,
+    )
+    if not any(value is not None for value in target_fields):
+        return None
+    if (
+        message.provider_name is None
+        or message.provider_scope is None
+        or message.provider_target_id is None
+        or message.provider_message_id is None
+        or message.provider_event_id is None
+    ):
+        raise ReplyTargetError(ReplyMode.PASSIVE, "persisted target metadata is incomplete")
+    return ReplyTarget(
+        mode=ReplyMode.PASSIVE,
+        provider_name=message.provider_name,
+        provider_scope=message.provider_scope,
+        target_id=message.provider_target_id,
+        message_id=message.provider_message_id,
+        event_id=message.provider_event_id,
+        msg_seq=message.provider_msg_seq,
+    )
 
 
 def load_context(database: Database, run_id: str) -> RunContext | None:
@@ -130,23 +161,14 @@ def load_context(database: Database, run_id: str) -> RunContext | None:
             if run.final_message_id is not None
             else None
         )
-        reply_target = None
-        if (
-            message.provider_name is not None
-            and message.provider_scope is not None
-            and message.provider_target_id is not None
-            and message.provider_message_id is not None
-            and message.provider_event_id is not None
-        ):
-            reply_target = ReplyTarget(
-                mode=ReplyMode.PASSIVE,
-                provider_name=message.provider_name,
-                provider_scope=message.provider_scope,
-                target_id=message.provider_target_id,
-                message_id=message.provider_message_id,
-                event_id=message.provider_event_id,
-                msg_seq=message.provider_msg_seq,
-            )
+        try:
+            reply_target = reply_target_from_message(message)
+        except ReplyTargetError as error:
+            run.state = AgentRunState.FAILED.value
+            run.error = str(error)
+            if session_row.active_run_id == run.id:
+                session_row.active_run_id = None
+            return None
         return RunContext(
             run_id=run_id,
             session_id=run.session_id,

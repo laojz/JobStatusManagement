@@ -1,6 +1,6 @@
 """Application health endpoint."""
 
-from typing import TypedDict
+from typing import Final, TypedDict
 
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -9,6 +9,8 @@ from starlette.responses import JSONResponse, Response
 
 from jobs_status_manager.application.operations import list_tasks
 from jobs_status_manager.infrastructure.database.migrations import current_revision
+
+HEAD_REVISION: Final = "0008_qq_reply_targets"
 
 
 class HealthPayload(TypedDict):
@@ -28,29 +30,34 @@ class HealthPayload(TypedDict):
     product_readiness: str
 
 
+def live(_: Request) -> Response:
+    """Return process liveness without consulting application dependencies."""
+    return JSONResponse({"status": "alive"}, status_code=200)
+
+
 def health(request: Request) -> Response:
     """Return readiness and schema status without business data."""
     database = request.state.database
     readiness = request.state.readiness
     database_status = "ok"
     schema_version: str | None = None
+    failed_tasks = 0
+    stale_tasks = 0
     try:
         with database.engine.connect() as connection:
             connection.execute(text("SELECT 1"))
         schema_version = current_revision(f"sqlite:///{database.path}")
-        if schema_version is None:
+        if schema_version is None or schema_version != HEAD_REVISION:
             database_status = "not_ready"
+        if database_status == "ok":
+            tasks = list_tasks(database, include_stale=True)
+            failed_tasks = sum(not task.stale for task in tasks)
+            stale_tasks = sum(task.stale for task in tasks)
     except (OSError, RuntimeError, SQLAlchemyError):
         database_status = "unavailable"
 
-    failed_tasks = 0
-    stale_tasks = 0
-    if database_status == "ok" and schema_version is not None:
-        tasks = list_tasks(database, include_stale=True)
-        failed_tasks = sum(not task.stale for task in tasks)
-        stale_tasks = sum(task.stale for task in tasks)
     external_ready = readiness["product_readiness"] in {"ready", "local_only"}
-    ready = database_status == "ok" and schema_version is not None and external_ready
+    ready = database_status == "ok" and schema_version == HEAD_REVISION and external_ready
     durable_tasks = "degraded" if failed_tasks or stale_tasks else "ok"
     payload: HealthPayload = {
         "status": "ready" if ready else "not_ready",

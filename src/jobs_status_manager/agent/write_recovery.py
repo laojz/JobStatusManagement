@@ -6,9 +6,10 @@ from typing import TYPE_CHECKING, assert_never
 
 from sqlalchemy import or_, select
 
-from jobs_status_manager.agent.contracts import AgentRunState, ProviderErrorKind
+from jobs_status_manager.agent.contracts import AgentRunState, ProviderErrorKind, ReplyTargetError
 from jobs_status_manager.agent.models import AgentRun, ConversationMessage
 from jobs_status_manager.agent.models import Session as AgentSession
+from jobs_status_manager.agent.runtime_support import reply_target_from_message
 from jobs_status_manager.agent.write_runtime import (
     finalize_rejected_action,
     record_confirmation_delivery,
@@ -52,6 +53,7 @@ def retry_confirmation_prompts(services: RuntimeServices) -> int:
                 session.scalar(
                     select(AgentSession.user_id).where(AgentSession.id == run.session_id)
                 ),
+                session.get(ConversationMessage, run.user_message_id),
             )
             for run in runs
         ]
@@ -59,11 +61,27 @@ def retry_confirmation_prompts(services: RuntimeServices) -> int:
             run.attempt_count += 1
             run.next_retry_at = None
     attempted = 0
-    for run_id, prompt, user_id in prompts:
+    for run_id, prompt, user_id, inbound_message in prompts:
         if prompt is None or user_id is None:
             continue
         try:
-            delivery = services.qq.push(user_id, prompt)
+            target = None if inbound_message is None else reply_target_from_message(inbound_message)
+        except ReplyTargetError as exception:
+            record_confirmation_delivery(
+                services,
+                run_id,
+                success=False,
+                error=str(exception),
+                provider_error_kind=ProviderErrorKind.PERMANENT,
+            )
+            attempted += 1
+            continue
+        try:
+            delivery = (
+                services.qq.push(user_id, prompt)
+                if target is None
+                else services.qq.deliver(target, prompt)
+            )
         except (RuntimeError, ValueError, TimeoutError) as exception:
             record_confirmation_delivery(
                 services,

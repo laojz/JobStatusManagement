@@ -17,6 +17,35 @@ curl --fail http://127.0.0.1:8000/health
 
 The QQ endpoint is `POST /webhooks/qq` with `x-qq-webhook-token` when configured. Webhook intake is durable and idempotent; long LLM, tool, file, embedding, and Chroma work runs after the quick 2xx response.
 
+## HTTP probes and response matrix
+
+Use `/live` to decide whether the process is answering and `/health` to decide
+whether it should receive work. `/live` is deliberately dependency-free: it
+does not query SQLite or any external capability and returns HTTP 200 with
+`{"status":"alive"}` while the application can answer.
+
+`/health` preserves its existing JSON fields and is readiness-oriented. It is
+HTTP 200 only when SQLite is readable, the schema is exactly
+`0008_qq_reply_targets`, and the configured capability state is ready or
+explicitly local-only. Missing or non-head schema is HTTP 503 with
+`database=not_ready`; a failed database read is HTTP 503 with
+`database=unavailable`.
+
+| Observed condition | `/live` | `/health` | Action |
+| --- | ---: | ---: | --- |
+| Process answers; database/schema ready; no failed or stale tasks | 200 | 200, `durable_tasks=ok` | Continue normal operation. |
+| Database unavailable | 200 | 503, `database=unavailable` | Do not admit work; inspect path, permissions, locks, and logs. |
+| Schema missing or not at head | 200 | 503, `database=not_ready` | Run migration and `current` against the configured database; do not use a side database. |
+| Local IMAP and LLM disabled | 200 | 200, `product_readiness=local_only` | Treat as local-only, not as external-provider readiness. |
+| Enabled capability unavailable or production fake adapter | 200 | 503, `product_readiness=not_ready` | Correct configuration or adapter wiring; do not claim provider compatibility. |
+| Failed or stale durable task with otherwise-ready dependencies | 200 | 200, `durable_tasks=degraded` | Do not restart solely because of durable degradation; inspect and recover the task. |
+
+The process supervisor is intentionally not specified by product name or an
+unverified service artifact in this repository. If one is added, it should
+restart only for a failed process-level liveness policy or an explicitly
+approved readiness policy, never because a single durable task is degraded.
+It must keep one process against one SQLite database and forward SIGTERM.
+
 ## Failures and retry
 
 ```bash
@@ -30,6 +59,22 @@ uv run python -m jobs_status_manager retry knowledge_cleanup <KNOWLEDGE_DOCUMENT
 ```
 
 Failure output contains bounded errors and IDs, not message bodies or credentials. Retry only requeues an existing failed record and never bypasses PendingAction confirmation. AgentRun records are inspectable but deliberately have no unsafe manual retry operation.
+
+`durable_tasks=degraded` is an explicit persisted-work condition, not process
+death. Run `failures --include-stale` and use the matching operation only after
+identifying the task kind and state:
+
+| Task state | Operator response |
+| --- | --- |
+| Failed outbox, notification, pending action, or knowledge task | Inspect the bounded error and ID, then use the corresponding `retry` command when the business impact is understood. |
+| Stale notification, pending action, agent run, or knowledge indexing task | Confirm startup recovery ran, inspect again with `--include-stale`, and retry or escalate according to the task kind. |
+| Failed or stale `AgentRun` | Inspect and recover through the normal lifecycle; there is intentionally no unsafe manual retry command. |
+| Ambiguous external delivery | Record the ambiguity and stop; do not blindly retry or claim exactly-once delivery. |
+
+The five-minute stale threshold applies to `SENDING`, `INDEXING`, `EXECUTING`,
+and `RUNNING` durable states. `durable_tasks=ok` means the health query found no
+failed or stale rows; it does not prove provider compatibility or zero current
+in-flight work.
 
 Outbox and Notification delivery are at-least-once with persisted idempotency. An uncertain QQ timeout may produce a duplicate external message, but not a duplicate Application, JobEvent, or KnowledgeDocument fact.
 

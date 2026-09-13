@@ -37,6 +37,48 @@ def test_settings_require_local_identity_fields(monkeypatch: MonkeyPatch) -> Non
     assert "secret-value" not in message
 
 
+def test_from_environment_can_disable_dotenv_source(tmp_path: Path) -> None:
+    """An absent explicit source does not load a working-directory dotenv file."""
+    env_file = tmp_path / ".env"
+    env_file.write_text("APP_DATABASE_PATH=ambient.db\n")
+
+    with pytest.raises(ValidationError) as raised:
+        AppSettings.from_environment(env_file=None)
+
+    assert "database_path" in safe_settings_error(raised.value)
+
+
+def test_test_settings_ignore_working_directory_dotenv(
+    tmp_path: Path, monkeypatch: MonkeyPatch
+) -> None:
+    """The pytest source guard ignores a valid ambient working-directory dotenv file."""
+    env_file = tmp_path / ".env"
+    copyfile(Path(__file__).resolve().parents[2] / ".env.example", env_file)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValidationError) as raised:
+        AppSettings()
+
+    assert "database_path" in safe_settings_error(raised.value)
+
+
+def test_from_environment_reads_explicit_dotenv_source(tmp_path: Path) -> None:
+    """Production-style loading remains available when a dotenv source is explicit."""
+    env_file = tmp_path / ".env"
+    copyfile(Path(__file__).resolve().parents[2] / ".env.example", env_file)
+    env_file.write_text(
+        env_file.read_text()
+        .replace("APP_IMAP_ENABLED=false", "APP_IMAP_ENABLED=true")
+        .replace("APP_LLM_ENABLED=false", "APP_LLM_ENABLED=true")
+    )
+
+    settings = AppSettings.from_environment(env_file=env_file)
+
+    assert settings.database_path == Path("data/jobs_status.db")
+    assert settings.imap_enabled is False
+    assert settings.llm_enabled is False
+
+
 def test_secret_like_log_keys_are_redacted() -> None:
     """Secret-like keys are replaced while ordinary fields remain."""
     result = redact_event("", "", {"api_token": "secret-value", "phase": "0"})

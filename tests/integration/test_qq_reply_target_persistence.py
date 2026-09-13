@@ -111,3 +111,52 @@ def test_context_updates_preserve_reply_target(
     updated = update_active_context(database, context)
 
     assert updated.reply_target == context.reply_target
+
+
+def test_partial_persisted_passive_target_fails_closed_after_restart(
+    database: Database,
+    settings: AppSettings,
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    upgrade_database(root, f"sqlite:///{settings.database_path}")
+    now = datetime(2026, 1, 1, tzinfo=UTC).isoformat()
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id, external_key, display_name, created_at, updated_at) "
+                "VALUES ('user', 'external', 'User', :now, :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, session_type, summary, created_at, "
+                "last_active_at, updated_at) VALUES "
+                "('session', 'user', 'MAIN', '', :now, :now, :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, provider_name, created_at) "
+                "VALUES ('message', 'session', 'user', 'hello', 'qq', :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs (id, session_id, user_message_id, state, created_at) "
+                "VALUES ('run', 'session', 'message', :state, :now)"
+            ),
+            {"state": AgentRunState.RUNNING.value, "now": now},
+        )
+
+    assert load_context(database, "run") is None
+
+    with database.engine.connect() as connection:
+        state, error = connection.execute(
+            text("SELECT state, error FROM agent_runs WHERE id = 'run'")
+        ).one()
+    assert state == AgentRunState.FAILED.value
+    assert error == "invalid passive reply target: persisted target metadata is incomplete"

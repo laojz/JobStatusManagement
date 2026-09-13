@@ -45,7 +45,7 @@ Complete QQ credentials without `APP_QQ_TOKEN_BASE_URL` also fail before
 startup. Both QQ API and token URLs must use HTTPS. `https://bots.qq.com` is retained only as an explicitly supplied,
 unverified SDK-era compatibility fallback; it is never a production default.
 
-## Startup, readiness, and shutdown
+## Startup, readiness, liveness, and shutdown
 
 ```bash
 uv sync
@@ -58,6 +58,20 @@ uv run python -m jobs_status_manager health
 uv run python -m jobs_status_manager run
 ```
 
+The application CLI reads `APP_DATABASE_PATH` from the selected `.env` or the
+process environment. Direct Alembic commands do not read `.env`; provide the
+same path explicitly for every migration operation:
+
+```bash
+APP_DATABASE_PATH=./data/jobs_status.db uv run alembic check
+APP_DATABASE_PATH=./data/jobs_status.db uv run alembic current
+APP_DATABASE_PATH=./data/jobs_status.db uv run alembic upgrade head
+```
+
+Alembic resolves a relative `APP_DATABASE_PATH` from the command's working
+directory. It has no `jobs_status_alembic.db` fallback, so omitting the variable
+fails instead of creating a side database.
+
 Use a supervisor that runs one private process, forwards SIGTERM, and restarts on failure. Keep `.env`, database/WAL files, Chroma, uploads, and backups private. Do not commit mailbox passwords, QQ credentials, LLM keys, or backup files.
 
 ```bash
@@ -69,13 +83,49 @@ uv run python -m jobs_status_manager restore-check ./backups/jobs-YYYYMMDD-HHMMS
 uv run python -m jobs_status_manager integrity-check
 ```
 
+`GET /live` is the liveness check. It returns HTTP 200 with `{"status":"alive"}`
+when the Starlette process can answer and does not query SQLite, migrations,
+durable tasks, IMAP, LLM, QQ, Chroma, or any other external capability. A
+failed `/live` probe can be used as evidence of a process-level failure; a
+dependency failure must not be converted into a liveness failure.
+
 `GET /health` is the readiness check. It returns HTTP 200 only after the
-database connection and migration head are available; HTTP 503 means the
-process is not ready. It does not prove QQ credentials or external endpoint
-reachability. The application starts worker tasks only after startup recovery
-and botpy transport readiness. On shutdown, worker tasks are cancelled first,
-then the lifecycle closes the botpy client, closes the Starlette transport, and
-disposes the database. Each owned resource is closed once.
+database connection succeeds, the schema revision is exactly
+`0008_qq_reply_targets`, and configured product capabilities are ready (or the
+runtime is explicitly local-only). HTTP 503 means the process is not ready.
+Missing schema is reported as `database: "not_ready"`; a database read failure
+is reported as `database: "unavailable"`. A non-head schema reports its
+observed `schema_version` but is not ready. The existing `/health` JSON field
+set is stable and includes database, schema, external capability, and durable
+task counters. It does not prove QQ credentials or external endpoint
+reachability.
+
+`durable_tasks: "degraded"` means the readiness query found one or more failed
+or stale persisted tasks. It does not change an otherwise-ready `/health` HTTP
+200 into HTTP 503 and does not by itself justify a process restart. Operators
+must inspect the bounded task list and apply the task-specific recovery
+procedure in [Operations](operations.md). This is distinct from `/live`: a
+healthy process can be ready while durable work needs attention.
+
+| Condition | `/live` | `/health` | Supervisor/operator action |
+| --- | ---: | ---: | --- |
+| Process answers; head schema and local-only or configured capabilities are ready | 200 | 200 | Keep one process running; admit work according to the configured mode. |
+| Process answers; database cannot be read | 200 | 503, `database=unavailable` | Do not route work; inspect logs, path, permissions, and locks before repair. Do not start a second process. |
+| Process answers; schema is missing or below `0008_qq_reply_targets` | 200 | 503, `database=not_ready` | Keep out of service; run migration/current checks against the same `APP_DATABASE_PATH`. |
+| Local runtime has IMAP and LLM disabled | 200 | 200, `product_readiness=local_only` | Keep running as local-only; do not call this production provider evidence. |
+| Configured capability is absent or construction failed | 200 | 503, `product_readiness=not_ready` | Keep out of production traffic; correct configuration or adapter wiring, then restart under the approved process policy. |
+| Failed or stale durable tasks, while base readiness is healthy | 200 | 200, `durable_tasks=degraded` | Do not restart solely from this field; run `failures --include-stale` and recover the identified task. |
+
+The repository does not prescribe a named supervisor, restart threshold, backoff,
+or production service file. Any supervisor integration must preserve one
+process per database, forward SIGTERM, use `/live` for process liveness, and
+use `/health` for traffic readiness. Local HTTP tests and fake adapters are
+not live QQ or provider validation.
+
+The application starts worker tasks only after startup recovery and botpy
+transport readiness. On shutdown, worker tasks are cancelled first, then the
+lifecycle closes the botpy client, closes the Starlette transport, and disposes
+the database. Each owned resource is closed once.
 
 Startup scans stale Notification `SENDING`, PendingAction `EXECUTING`, AgentRun
 `RUNNING`, and Knowledge `INDEXING` before worker loops. AnyIO structured

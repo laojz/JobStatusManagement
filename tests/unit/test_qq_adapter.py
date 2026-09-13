@@ -28,7 +28,7 @@ from pydantic import SecretStr
 
 from jobs_status_manager.agent import uploads
 from jobs_status_manager.agent.botpy_ingestion import receive_botpy_event
-from jobs_status_manager.agent.contracts import ReplyMode, ReplyTarget
+from jobs_status_manager.agent.contracts import ProviderErrorKind, ReplyMode, ReplyTarget
 from jobs_status_manager.agent.uploads import validate_attachment_url
 from jobs_status_manager.agent.webhook import WebhookContext
 from jobs_status_manager.application.lifecycle import _cleanup_lifecycle_resources
@@ -142,6 +142,19 @@ def test_gateway_maps_passive_target_to_botpy_send() -> None:
     assert content == "hello"
     assert msg_type is MessageType.TEXT
     assert extra == {"msg_seq": 7}
+
+
+def test_gateway_legacy_reply_rejects_missing_event_id_without_proactive_fallback() -> None:
+    client = Mock()
+    gateway = BotpyQQGateway(client, "configured-openid", 1, _run_operation)
+
+    result = gateway.reply("inbound-openid", "message-id", "hello")
+
+    assert result.success is False
+    assert result.provider_error is not None
+    assert result.provider_error.kind is ProviderErrorKind.PERMANENT
+    assert result.provider_error.code == "passive_target_requires_event_id"
+    client.send.assert_not_called()
 
 
 def test_gateway_maps_media_operations_to_botpy_media_methods() -> None:
@@ -1370,6 +1383,68 @@ async def test_handler_failure_after_receipt_still_returns_sdk_ack_and_reports_e
     assert response.status == 200
     assert json.loads(response.body) == {"op": 12, "d": 0}
     assert [str(error) for error in reported] == ["post-receipt handler failed"]
+
+
+@pytest.mark.anyio
+async def test_success_ack_does_not_wait_for_blocked_post_receipt_handler() -> None:
+    handler_started = anyio.Event()
+    handler_release = anyio.Event()
+    response_ready = anyio.Event()
+    response_holder: list[int] = []
+
+    async def blocked_handler(_: RawEvent) -> None:
+        handler_started.set()
+        await handler_release.wait()
+
+    async def request(transport: StarletteEventTransport, body: bytes) -> None:
+        response = await transport.handle_request(_signed_request(body, "test-app-secret"))
+        response_holder.append(response.status)
+        response_ready.set()
+
+    body = json.dumps({"op": 0, "t": "C2C_MESSAGE_CREATE", "d": {}}).encode()
+    transport = StarletteEventTransport("app-id", "test-app-secret", _noop_event)
+    transport._handler = blocked_handler
+
+    async with anyio.create_task_group() as task_group:
+        transport.bind_handler_task_group(task_group)
+        task_group.start_soon(request, transport, body)
+        await handler_started.wait()
+        with anyio.fail_after(1):
+            await response_ready.wait()
+        await transport.close()
+        handler_release.set()
+        task_group.cancel_scope.cancel()
+
+    assert response_holder == [200]
+
+
+@pytest.mark.anyio
+async def test_transport_close_cancels_pending_post_receipt_handler() -> None:
+    handler_started = anyio.Event()
+    handler_cancelled = anyio.Event()
+
+    async def blocked_handler(_: RawEvent) -> None:
+        handler_started.set()
+        try:
+            await anyio.sleep_forever()
+        finally:
+            handler_cancelled.set()
+
+    body = json.dumps({"op": 0, "t": "C2C_MESSAGE_CREATE", "d": {}}).encode()
+    transport = StarletteEventTransport("app-id", "test-app-secret", _noop_event)
+    transport._handler = blocked_handler
+
+    async with anyio.create_task_group() as task_group:
+        transport.bind_handler_task_group(task_group)
+        task_group.start_soon(
+            transport.handle_request,
+            _signed_request(body, "test-app-secret"),
+        )
+        await handler_started.wait()
+        await transport.close()
+        with anyio.fail_after(1):
+            await handler_cancelled.wait()
+        task_group.cancel_scope.cancel()
 
 
 @pytest.mark.anyio

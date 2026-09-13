@@ -15,6 +15,7 @@ import structlog
 from botpy.protocol.errors import ApiError, TransportError
 from botpy.protocol.events import parse_gateway_event
 from botpy.protocol.message import MediaSendResult, MessageType
+from botpy.protocol.models import RawEvent
 from botpy.protocol.models import ReplyTarget as SdkReplyTarget
 from botpy.protocol.transport import (
     EventHandler,
@@ -174,17 +175,9 @@ class BotpyQQGateway:
         )
 
     def reply(self, user_id: str, message_id: str, content: str) -> BotpyDeliveryResult:
-        """Send a compatibility reply through the configured C2C identity."""
-        del user_id, message_id
-        return self._send_text(
-            ReplyTarget(
-                mode=ReplyMode.PROACTIVE,
-                provider_name="qq",
-                provider_scope="c2c",
-                target_id=self._configured_openid,
-            ),
-            content,
-        )
+        """Reject an incomplete passive reply instead of downgrading it."""
+        del user_id, message_id, content
+        return _classified_result(ProviderErrorKind.PERMANENT, "passive_target_requires_event_id")
 
     def deliver(self, target: ReplyTarget, content: str) -> BotpyDeliveryResult:
         """Send text to a passive or proactive provider-neutral target."""
@@ -407,6 +400,8 @@ class StarletteEventTransport(RequestTransport):
         self._handler: EventHandler | None = None
         self._stop_event: anyio.Event | None = None
         self._ready_event: anyio.Event | None = None
+        self._handler_task_group: anyio.abc.TaskGroup | None = None
+        self._handler_cancel_scopes: set[anyio.CancelScope] = set()
         self._running = False
         self._closed = False
         self._dispatch_timestamp_max_age_seconds = dispatch_timestamp_max_age_seconds
@@ -434,6 +429,10 @@ class StarletteEventTransport(RequestTransport):
             self._ready_event = None
             self._running = False
 
+    def bind_handler_task_group(self, task_group: anyio.abc.TaskGroup) -> None:
+        """Bind post-receipt handlers to the lifecycle-owned task group."""
+        self._handler_task_group = task_group
+
     async def wait_ready(self) -> None:
         """Wait until the SDK handler is installed and requests are accepted."""
         if self._closed:
@@ -450,6 +449,8 @@ class StarletteEventTransport(RequestTransport):
         if self._closed:
             return
         self._closed = True
+        for cancel_scope in tuple(self._handler_cancel_scopes):
+            cancel_scope.cancel()
         if self._stop_event is not None:
             self._stop_event.set()
 
@@ -488,11 +489,23 @@ class StarletteEventTransport(RequestTransport):
             return WebhookResponse(receipt.status_code, receipt.body)
         handler = self._handler
         if handler is not None:
+            parsed_event = parse_gateway_event(payload)
+            task_group = self._handler_task_group
+            if task_group is None:
+                await self._run_handler(handler, parsed_event)
+            else:
+                task_group.start_soon(self._run_handler, handler, parsed_event)
+        return self._json_response(200, {"op": 12, "d": 0})
+
+    async def _run_handler(self, handler: EventHandler, event: RawEvent) -> None:
+        with anyio.CancelScope() as cancel_scope:
+            self._handler_cancel_scopes.add(cancel_scope)
             try:
-                await handler(parse_gateway_event(payload))
+                await handler(event)
             except Exception as error:  # noqa: BLE001
                 await self._report_handler_error(error)
-        return self._json_response(200, {"op": 12, "d": 0})
+            finally:
+                self._handler_cancel_scopes.discard(cancel_scope)
 
     async def _report_handler_error(self, error: Exception) -> None:
         """Report post-receipt SDK dispatch failures without changing the ACK."""
@@ -622,6 +635,8 @@ class LifespanBotpyRuntime:
         if self._closed:
             message = "botpy runtime is closed"
             raise RuntimeError(message)
+        if isinstance(self.transport, StarletteEventTransport) and task_group is not None:
+            self.transport.bind_handler_task_group(task_group)
         transport_task = await self.client.start(self.app_id, self.app_secret, ret_coro=True)
         if transport_task is None:
             await self.transport.wait_ready()

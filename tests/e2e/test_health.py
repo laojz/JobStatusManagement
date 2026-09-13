@@ -1,16 +1,23 @@
 """Foundation HTTP lifecycle tests."""
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Never
 
 import pytest
+from alembic import command
+from sqlalchemy import text
 from starlette.testclient import TestClient
 
 from jobs_status_manager.agent.contracts import ConversationPrompt, ConversationResponse
 from jobs_status_manager.application.lifecycle import LifecycleAdapters, create_app
 from jobs_status_manager.config.settings import AppSettings
 from jobs_status_manager.infrastructure.adapters.fakes import FakeIMAPGateway, FakeLLM
-from jobs_status_manager.infrastructure.database.migrations import upgrade_database
+from jobs_status_manager.infrastructure.database.connection import Database
+from jobs_status_manager.infrastructure.database.migrations import (
+    migration_config,
+    upgrade_database,
+)
 from jobs_status_manager.mail import JobMailAnalysisInput, MailPollBatch
 
 
@@ -36,6 +43,139 @@ def test_health_startup_and_shutdown(settings: AppSettings) -> None:
             "llm": "disabled",
             "product_readiness": "local_only",
         }
+
+
+def test_live_is_successful_without_database_or_external_capabilities(
+    settings: AppSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.setattr(
+        "jobs_status_manager.application.lifecycle._startup_recovery",
+        lambda database, adapters, runtime_settings: None,
+    )
+    app = create_app(settings, root)
+
+    with TestClient(app) as client:
+        response = client.get("/live")
+        health_response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "alive"}
+    assert health_response.status_code == 503
+    assert health_response.json()["database"] == "not_ready"
+
+
+def test_health_rejects_schema_that_is_not_at_head(
+    settings: AppSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    database_url = f"sqlite:///{settings.database_path}"
+    upgrade_database(root, database_url)
+    command.downgrade(migration_config(root, database_url), "0007_phase6_reliability")
+    monkeypatch.setattr(
+        "jobs_status_manager.application.lifecycle._startup_recovery",
+        lambda database, adapters, runtime_settings: None,
+    )
+    app = create_app(settings, root)
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 503
+    assert response.json()["database"] == "not_ready"
+    assert response.json()["schema_version"] == "0007_phase6_reliability"
+    assert response.json()["readiness"] == "not_ready"
+
+
+def test_health_reports_failed_and_stale_tasks_without_process_failure(
+    settings: AppSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    upgrade_database(root, f"sqlite:///{settings.database_path}")
+    now = datetime.now(UTC).replace(tzinfo=None)
+    now_text = now.isoformat(sep=" ")
+    stale_text = (now - timedelta(days=1)).isoformat(sep=" ")
+    database = Database(settings.database_path)
+    try:
+        with database.engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO users "
+                    "(id, external_key, display_name, created_at, updated_at) "
+                    "VALUES ('user', 'external', 'User', :now, :now)"
+                ),
+                {"now": now_text},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO notifications "
+                    "(id, user_id, type, channel, title, content, source_event_id, state, "
+                    "attempt_count, last_attempt_at, last_error, created_at, updated_at) "
+                    "VALUES (:failed_id, 'user', 'TEST', 'local', 'failed', 'redacted', "
+                    "'event-failed', 'FAILED', 1, :now, 'bounded failure', :now, :now), "
+                    "(:stale_id, 'user', 'TEST', 'local', 'stale', 'redacted', "
+                    "'event-stale', 'SENDING', 1, :stale_at, NULL, :now, :now)"
+                ),
+                {
+                    "failed_id": "failed-notification",
+                    "stale_id": "stale-notification",
+                    "now": now_text,
+                    "stale_at": stale_text,
+                },
+            )
+    finally:
+        database.dispose()
+    monkeypatch.setattr(
+        "jobs_status_manager.application.lifecycle._startup_recovery",
+        lambda database, adapters, runtime_settings: None,
+    )
+    monkeypatch.setattr(
+        "jobs_status_manager.application.lifecycle._recover_notifications",
+        lambda database, adapters: None,
+    )
+    app = create_app(settings, root)
+
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["durable_tasks"] == "degraded"
+    assert payload["failed_tasks"] == 1
+    assert payload["stale_tasks"] == 1
+
+
+def test_health_reports_database_unavailable_while_live_stays_successful(
+    settings: AppSettings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    monkeypatch.setattr(
+        "jobs_status_manager.application.lifecycle._startup_recovery",
+        lambda database, adapters, runtime_settings: None,
+    )
+    monkeypatch.setattr(
+        "jobs_status_manager.application.health.current_revision",
+        lambda database_url: _raise_database_failure(),
+    )
+    app = create_app(settings, root)
+
+    with TestClient(app) as client:
+        live_response = client.get("/live")
+        health_response = client.get("/health")
+
+    assert live_response.status_code == 200
+    assert health_response.status_code == 503
+    assert health_response.json()["database"] == "unavailable"
+    assert health_response.json()["schema_version"] is None
+    assert health_response.json()["readiness"] == "not_ready"
+
+
+def _raise_database_failure() -> Never:
+    raise RuntimeError
 
 
 def test_production_health_rejects_explicit_fake_external_adapters(

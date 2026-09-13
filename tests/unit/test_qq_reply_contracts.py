@@ -31,6 +31,25 @@ def test_passive_target_requires_provider_reply_metadata() -> None:
 
 
 @pytest.mark.parametrize(
+    ("message_id", "event_id"),
+    [(None, "event"), ("message", None)],
+)
+def test_passive_target_rejects_missing_required_identifier(
+    message_id: str | None,
+    event_id: str | None,
+) -> None:
+    with pytest.raises(ReplyTargetError, match="message_id and event_id are required"):
+        ReplyTarget(
+            mode=ReplyMode.PASSIVE,
+            provider_name="qq",
+            provider_scope="c2c",
+            target_id="openid",
+            message_id=message_id,
+            event_id=event_id,
+        )
+
+
+@pytest.mark.parametrize(
     "field_name",
     ["provider_name", "provider_scope", "target_id", "message_id", "event_id"],
 )
@@ -57,6 +76,27 @@ def test_proactive_target_rejects_passive_only_fields() -> None:
             target_id="openid",
             message_id="message",
             event_id=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("message_id", "event_id", "msg_seq"),
+    [("value", None, None), (None, "value", None), (None, None, 3)],
+)
+def test_proactive_target_rejects_every_passive_metadata_field(
+    message_id: str | None,
+    event_id: str | None,
+    msg_seq: int | None,
+) -> None:
+    with pytest.raises(ValueError, match="proactive reply target"):
+        ReplyTarget(
+            mode=ReplyMode.PROACTIVE,
+            provider_name="qq",
+            provider_scope="c2c",
+            target_id="openid",
+            message_id=message_id,
+            event_id=event_id,
+            msg_seq=msg_seq,
         )
 
 
@@ -96,10 +136,14 @@ def test_fake_qq_gateway_records_explicit_passive_and_proactive_modes() -> None:
 
     gateway.deliver(passive, "passive")
     gateway.deliver(proactive, "proactive")
+    gateway.reply("openid", "message", "reply")
+    gateway.push("openid", "push")
 
     assert gateway.calls == [
         ("deliver", ("PASSIVE", "qq", "c2c", "openid", "message", "event", "", "passive")),
         ("deliver", ("PROACTIVE", "qq", "c2c", "openid", "", "", "", "proactive")),
+        ("reply", ("openid", "message", "reply")),
+        ("push", ("openid", "push")),
     ]
 
 

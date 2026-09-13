@@ -32,7 +32,7 @@ from jobs_status_manager.agent.write_recovery import (
     reconcile_terminal_actions,
     retry_confirmation_prompts,
 )
-from jobs_status_manager.application.health import health
+from jobs_status_manager.application.health import health, live
 from jobs_status_manager.application_core.service import recover_pending_actions
 from jobs_status_manager.event_pipeline import EventServices, publish_once
 from jobs_status_manager.identity.models import MailAccount
@@ -512,6 +512,7 @@ def create_app(
             await _cleanup_lifecycle_resources(runtime_to_close, owned, database)
 
     routes = [
+        Route("/live", live, methods=["GET"]),
         Route("/health", health, methods=["GET"]),
         Route(settings.qq_webhook_path, qq_webhook, methods=["POST"]),
     ]

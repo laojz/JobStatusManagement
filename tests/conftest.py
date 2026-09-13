@@ -2,6 +2,7 @@
 
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from os import environ
 from pathlib import Path
 from uuid import UUID
 
@@ -11,6 +12,17 @@ from jobs_status_manager.config.settings import AppSettings
 from jobs_status_manager.infrastructure.clock import FakeClock
 from jobs_status_manager.infrastructure.database.connection import Database
 from jobs_status_manager.infrastructure.ids import DeterministicIdGenerator
+
+
+@pytest.fixture(autouse=True)
+def isolate_ambient_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests independent from the caller's dotenv and APP_ environment."""
+    for name in tuple(environ):
+        if name.startswith("APP_"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("APP_IMAP_ENABLED", "false")
+    monkeypatch.setenv("APP_LLM_ENABLED", "false")
+    monkeypatch.setitem(AppSettings.model_config, "env_file", None)
 
 
 @pytest.fixture

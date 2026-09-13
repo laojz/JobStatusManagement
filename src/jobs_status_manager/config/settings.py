@@ -87,9 +87,9 @@ class AppSettings(BaseSettings):
     max_upload_bytes: int = 10_485_760
 
     @classmethod
-    def from_environment(cls) -> "AppSettings":
-        """Load settings from environment and dotenv sources."""
-        return cls()
+    def from_environment(cls, *, env_file: str | Path | None = ".env") -> "AppSettings":
+        """Load settings from environment and the explicitly selected dotenv source."""
+        return cls(_env_file=env_file)
 
     @field_validator(
         "bootstrap_user_external_key",

@@ -51,6 +51,12 @@ stopped-process `rebuild-chroma` command.
 
 ## Acceptance status
 
+The current evidence reconciliation is maintained in
+[`docs/evidence/index.md`](docs/evidence/index.md). The authoritative
+pre-fix baseline on 2026-09-13 was `373 passed + 2 failed`; later results must
+be labeled with their execution context. Historical phase counts below are
+snapshots and do not replace that baseline.
+
 Phase 0 acceptance passed on 2026-09-09 before Phase 1 work began. Its
 historical result was 10 passing tests, clean Ruff and basedpyright checks,
 and Alembic revision `0001_identity (head)`. Phase 1 and Phase 2 were also
@@ -61,7 +67,7 @@ checks, plus a successful `0006 -> 0005 -> 0006` Alembic round trip. Full Phase
 5 acceptance remains partial: the credential-free real `LocalChroma` temporary-path
 rebuild/search drill and the real Bailian provider smoke passed. The complete QQ file-to-RAG E2E
 and the three-tool composite Agent scenario remain pending.
-Phase 6 acceptance passed on 2026-09-11 with 120 tests, clean Ruff, format,
+Phase 6 acceptance passed on 2026-09-11 with a historical snapshot of 120 tests, clean Ruff, format,
 basedpyright, and Alembic checks, a real Bailian `text-embedding-v4` 1024-dimensional
 finite-vector smoke, isolated CLI rebuild counts, and successful matching retrieval.
 The current database revision is `0008_qq_reply_targets (head)`.
@@ -89,9 +95,9 @@ and [`docs/phase-6-verification.md`](docs/phase-6-verification.md).
 qq-botpy-sdk==2.0.4
 uv run pytest -q tests/unit/test_openai_compatible_llm.py
                                            PASS: 31 passed
-uv run pytest -q                         373 passed; 2 pre-existing readiness assertion failures, unrelated to adapter changes
+uv run pytest -q                         PRE-FIX BASELINE: 373 passed; 2 readiness assertion failures; CURRENT CONTROLLED WORKTREE: 404 passed
 uv run ruff check .                      PASS
-uv run ruff format --check .             PASS (180 files)
+uv run ruff format --check .             PASS (206 files)
 uv run basedpyright                      0 errors, 0 warnings, 0 notes
 uv lock --check                          PASS
 uv run alembic check                     PASS (no new upgrade operations detected)

@@ -86,8 +86,9 @@ the verification suite.
 
 - The full QQ PDF upload -> ParseDocument -> AddKnowledge confirmation -> index
   -> search scenario is not yet covered through the HTTP/Agent surface.
-- The Application + Mail + SearchKnowledge three-tool sequence is not yet
-  covered by one composite AgentRun E2E test.
+- The deterministic non-QQ Application + Mail + SearchKnowledge sequence is
+  covered by `tests/integration/test_composite_agent_evidence.py`; approved
+  real-provider business E2E evidence remains pending.
 - Stale `INDEXING` restart recovery and a complete Chroma-loss rebuild are not
   exercised. A rebuild command is deferred to the Phase 6 reliability scope.
 - Alibaba Cloud Bailian Embedding is implemented and wired for production

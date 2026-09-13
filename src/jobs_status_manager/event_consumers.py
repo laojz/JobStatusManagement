@@ -142,41 +142,73 @@ def consume_action_created(services: EventServices, event_id: str, action_id: st
         if action is None:
             message = f"pending action not found: {action_id}"
             raise RuntimeError(message)
-        if action.mail_analysis_id is None:
-            message = f"pending action has no mail analysis: {action_id}"
-            raise RuntimeError(message)
-        analysis = session.get(JobMailAnalysis, action.mail_analysis_id)
-        if analysis is None:
-            message = f"job mail analysis not found: {action.mail_analysis_id}"
-            raise RuntimeError(message)
-        mail = session.get(Mail, analysis.mail_id)
-        if mail is None:
-            message = f"mail not found for analysis: {analysis.id}"
-            raise RuntimeError(message)
-        arguments = StatusUpdateArguments.model_validate(action.resolved_arguments)
-        session.add(
-            Notification(
-                id=str(services.mail.ids.new_id()),
-                user_id=mail.user_id,
-                type="PENDING_ACTION_CONFIRMATION",
-                channel="QQ_PUSH",
-                title="请确认状态更新",
-                content=confirmation_content(
-                    arguments.company,
-                    arguments.position,
-                    arguments.status.value,
-                    action.confirmation_code,
-                    arguments.interview_round,
-                ),
-                source_event_id=event_id,
-                related_mail_id=mail.id,
-                related_pending_action_id=action.id,
-                state=NotificationState.PENDING.value,
-                attempt_count=0,
-                created_at=services.mail.clock.now(),
-                updated_at=services.mail.clock.now(),
-            )
-        )
+        match action.action_type:
+            case "UpdateApplicationStatus":
+                if action.source_type != "mail_analysis" or action.mail_analysis_id is None:
+                    message = (
+                        "mail status action has mismatched source or missing mail analysis: "
+                        f"{action_id}"
+                    )
+                    raise RuntimeError(message)
+                analysis = session.get(JobMailAnalysis, action.mail_analysis_id)
+                if analysis is None:
+                    message = f"job mail analysis not found: {action.mail_analysis_id}"
+                    raise RuntimeError(message)
+                mail = session.get(Mail, analysis.mail_id)
+                if mail is None:
+                    message = f"mail not found for analysis: {analysis.id}"
+                    raise RuntimeError(message)
+                arguments = StatusUpdateArguments.model_validate(action.resolved_arguments)
+                session.add(
+                    Notification(
+                        id=str(services.mail.ids.new_id()),
+                        user_id=mail.user_id,
+                        type="PENDING_ACTION_CONFIRMATION",
+                        channel="QQ_PUSH",
+                        title="请确认状态更新",
+                        content=confirmation_content(
+                            arguments.company,
+                            arguments.position,
+                            arguments.status.value,
+                            action.confirmation_code,
+                            arguments.interview_round,
+                        ),
+                        source_event_id=event_id,
+                        related_mail_id=mail.id,
+                        related_pending_action_id=action.id,
+                        state=NotificationState.PENDING.value,
+                        attempt_count=0,
+                        created_at=services.mail.clock.now(),
+                        updated_at=services.mail.clock.now(),
+                    )
+                )
+            case "AddKnowledge" | "RemoveKnowledge":
+                if action.source_type != "agent_tool":
+                    message = f"knowledge action has mismatched source: {action_id}"
+                    raise RuntimeError(message)
+                now = services.mail.clock.now()
+                session.add(
+                    Notification(
+                        id=str(services.mail.ids.new_id()),
+                        user_id=action.user_id,
+                        type="PENDING_ACTION_CONFIRMATION",
+                        channel="QQ_PUSH",
+                        title="请确认知识操作",
+                        content=(
+                            f"{action.display_summary}\n确认码: {action.confirmation_code}\n"
+                            "未确认前不会修改知识库。"
+                        ),
+                        source_event_id=event_id,
+                        related_pending_action_id=action.id,
+                        state=NotificationState.PENDING.value,
+                        attempt_count=0,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            case unsupported:
+                message = f"unsupported pending action type: {unsupported}"
+                raise RuntimeError(message)
         session.add(
             ProcessedEvent(
                 id=str(services.mail.ids.new_id()),
