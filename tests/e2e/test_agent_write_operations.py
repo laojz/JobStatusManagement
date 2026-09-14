@@ -42,15 +42,23 @@ def test_qq_status_update_requires_confirmation_and_resumes_original_run(
     llm = FakeLLM(
         conversation_responses=[
             ConversationResponse(
-                tool_call=ToolCallRequest(
-                    name="UpdateApplicationStatus",
-                    arguments={
-                        "company": "腾讯",
-                        "department": "后端",
-                        "position": "校招",
-                        "status": "INTERVIEW",
-                        "interview_round": 3,
-                    },
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-write-call",
+                        provider_type="function",
+                        name="UpdateApplicationStatus",
+                        arguments={
+                            "company": "腾讯",
+                            "department": "后端",
+                            "position": "校招",
+                            "status": "INTERVIEW",
+                            "interview_round": 3,
+                        },
+                        arguments_json=(
+                            '{"company":"腾讯","department":"后端","interview_round":3,'
+                            '"position":"校招","status":"INTERVIEW"}'
+                        ),
+                    ),
                 )
             ),
             ConversationResponse(answer="腾讯校招状态已更新为三面。"),

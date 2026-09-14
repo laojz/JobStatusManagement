@@ -17,6 +17,9 @@ curl --fail http://127.0.0.1:8000/health
 
 The QQ endpoint is `POST /webhooks/qq` with `x-qq-webhook-token` when configured. Webhook intake is durable and idempotent; long LLM, tool, file, embedding, and Chroma work runs after the quick 2xx response.
 
+完整的中文服务器端人工验证与故障排查手册见
+[`docs/deployed-manual-validation-troubleshooting.zh-CN.md`](deployed-manual-validation-troubleshooting.zh-CN.md)。
+
 ## HTTP probes and response matrix
 
 Use `/live` to decide whether the process is answering and `/health` to decide

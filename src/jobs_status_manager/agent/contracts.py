@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum, unique
-from typing import Final
+from typing import Final, Literal
 
 import pydantic.json_schema
 from pydantic import BaseModel, ConfigDict, Field, SkipValidation, model_validator
@@ -171,10 +171,13 @@ class ToolDefinition(BaseModel):
 class ToolCallRequest(BaseModel):
     """Typed LLM request for one tool invocation."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
+    provider_call_id: str = Field(min_length=1, max_length=255)
+    provider_type: Literal["function"]
     name: str = Field(min_length=1, max_length=100)
     arguments: dict[str, str | int | bool | None] = Field(default_factory=dict)
+    arguments_json: str = Field(min_length=2, max_length=12000)
 
 
 class ConversationResponse(BaseModel):
@@ -183,12 +186,12 @@ class ConversationResponse(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     answer: str | None = Field(default=None, max_length=12000)
-    tool_call: ToolCallRequest | None = None
+    tool_calls: tuple[ToolCallRequest, ...] = ()
 
     @model_validator(mode="after")
     def require_one_outcome(self) -> ConversationResponse:
-        """Require exactly one final answer or ToolCall."""
-        if (self.answer is None) == (self.tool_call is None):
+        """Require exactly one final answer or ordered tool-call batch."""
+        if (self.answer is not None) == bool(self.tool_calls):
             message = "conversation response requires exactly one outcome"
             raise ValueError(message)
         return self
@@ -203,12 +206,26 @@ class PromptMessage(BaseModel):
     content: str = Field(min_length=1, max_length=12000)
 
 
+class PromptToolCall(BaseModel):
+    """One durable provider tool call used to rebuild an assistant message."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    internal_tool_call_id: str = Field(min_length=1, max_length=36)
+    provider_call_id: str = Field(min_length=1, max_length=255)
+    provider_type: Literal["function"]
+    name: str = Field(min_length=1, max_length=100)
+    arguments_json: str = Field(min_length=2, max_length=12000)
+    assistant_sequence: int = Field(gt=0)
+    sequence: int = Field(gt=0)
+
+
 class PromptToolResult(BaseModel):
     """One persisted tool result included with its context references."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-    tool_call_id: str = Field(min_length=1, max_length=36)
+    internal_tool_call_id: str = Field(min_length=1, max_length=36)
     data: str = Field(max_length=12000)
     context_refs: dict[str, str | None] = Field(default_factory=dict)
 
@@ -216,7 +233,7 @@ class PromptToolResult(BaseModel):
 class ConversationPrompt(BaseModel):
     """Bounded prompt sent to the conversation LLM."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     system_prompt: str = SYSTEM_PROMPT
     session_summary: str = Field(default="", max_length=12000)
@@ -225,4 +242,5 @@ class ConversationPrompt(BaseModel):
     active_knowledge_document_id: str | None = None
     recent_messages: tuple[PromptMessage, ...] = ()
     user_message: str = Field(min_length=1, max_length=12000)
+    tool_calls: tuple[PromptToolCall, ...] = ()
     tool_results: tuple[PromptToolResult, ...] = ()

@@ -7,21 +7,26 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
+from jobs_status_manager.agent.continuation_state import (
+    ToolContinuationStateError,
+    load_tool_state,
+)
 from jobs_status_manager.agent.contracts import (
     MAX_RECENT_MESSAGES,
     SYSTEM_PROMPT,
     AgentRunState,
     PromptMessage,
+    PromptToolCall,
     PromptToolResult,
     ReplyMode,
     ReplyTarget,
     ReplyTargetError,
 )
-from jobs_status_manager.agent.models import AgentRun, ConversationMessage, ToolCall, ToolResult
+from jobs_status_manager.agent.models import AgentRun, ConversationMessage
 from jobs_status_manager.agent.models import Session as AgentSession
 from jobs_status_manager.agent.tool_runtime import (
     execute_tool,
-    persist_tool_call,
+    persist_tool_calls,
     persist_tool_error,
 )
 from jobs_status_manager.infrastructure.database.transactions import transaction
@@ -34,11 +39,20 @@ __all__ = [
     "RunContext",
     "execute_tool",
     "load_context",
-    "persist_tool_call",
+    "persist_tool_calls",
     "persist_tool_error",
     "reply_target_from_message",
     "update_active_context",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class PendingToolCall:
+    """One persisted provider call awaiting local execution."""
+
+    internal_tool_call_id: str
+    name: str
+    arguments: ToolArguments
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,11 +69,11 @@ class RunContext:
     active_knowledge_document_id: str | None
     recent_messages: tuple[PromptMessage, ...]
     user_message: str
+    tool_calls: tuple[PromptToolCall, ...]
     tool_results: tuple[PromptToolResult, ...]
     next_sequence: int
-    pending_tool_call_id: str | None
-    pending_tool_name: str | None
-    pending_tool_arguments: ToolArguments | None
+    next_assistant_sequence: int
+    pending_tool_calls: tuple[PendingToolCall, ...]
     final_message_id: str | None
     final_message_content: str | None
     state: str
@@ -95,7 +109,7 @@ def reply_target_from_message(message: ConversationMessage) -> ReplyTarget | Non
     )
 
 
-def load_context(database: Database, run_id: str) -> RunContext | None:
+def load_context(database: Database, run_id: str) -> RunContext | None:  # noqa: PLR0911
     """Load and validate the durable input snapshot for a running agent."""
     with transaction(database) as session:
         run = session.get(AgentRun, run_id)
@@ -129,32 +143,17 @@ def load_context(database: Database, run_id: str) -> RunContext | None:
                 .order_by(ConversationMessage.created_at, ConversationMessage.id)
             ).all()[-MAX_RECENT_MESSAGES:]
         )
-        tool_results = tuple(
-            PromptToolResult(
-                tool_call_id=result.tool_call_id,
-                data=result.data,
-                context_refs=result.context_refs,
-            )
-            for result in session.scalars(
-                select(ToolResult)
-                .join(ToolCall, ToolResult.tool_call_id == ToolCall.id)
-                .where(ToolCall.agent_run_id == run.id, ToolResult.error.is_(None))
-                .order_by(ToolCall.sequence)
-            )
-        )
-        calls = list(
-            session.scalars(
-                select(ToolCall).where(ToolCall.agent_run_id == run.id).order_by(ToolCall.sequence)
-            )
-        )
-        pending_call = next(
-            (
-                call
-                for call in calls
-                if session.scalar(select(ToolResult.id).where(ToolResult.tool_call_id == call.id))
-                is None
-            ),
-            None,
+        try:
+            tool_state = load_tool_state(session, run.id)
+        except ToolContinuationStateError as error:
+            run.state = AgentRunState.FAILED.value
+            run.error = str(error)
+            if session_row.active_run_id == run.id:
+                session_row.active_run_id = None
+            return None
+        pending_calls = tuple(
+            PendingToolCall(call_id, name, arguments)
+            for call_id, name, arguments in tool_state.pending_calls
         )
         final_message = (
             session.get(ConversationMessage, run.final_message_id)
@@ -180,11 +179,11 @@ def load_context(database: Database, run_id: str) -> RunContext | None:
             active_knowledge_document_id=session_row.active_knowledge_document_id,
             recent_messages=recent_messages,
             user_message=message.content,
-            tool_results=tool_results,
-            next_sequence=len(calls) + 1,
-            pending_tool_call_id=None if pending_call is None else pending_call.id,
-            pending_tool_name=None if pending_call is None else pending_call.tool_name,
-            pending_tool_arguments=None if pending_call is None else pending_call.arguments,
+            tool_calls=tool_state.tool_calls,
+            tool_results=tool_state.tool_results,
+            next_sequence=tool_state.next_sequence,
+            next_assistant_sequence=tool_state.next_assistant_sequence,
+            pending_tool_calls=pending_calls,
             final_message_id=run.final_message_id,
             final_message_content=None if final_message is None else final_message.content,
             state=run.state,
@@ -216,11 +215,11 @@ def update_active_context(database: Database, context: RunContext) -> RunContext
             active_knowledge_document_id=session_row.active_knowledge_document_id,
             recent_messages=context.recent_messages,
             user_message=context.user_message,
+            tool_calls=context.tool_calls,
             tool_results=context.tool_results,
             next_sequence=context.next_sequence,
-            pending_tool_call_id=context.pending_tool_call_id,
-            pending_tool_name=context.pending_tool_name,
-            pending_tool_arguments=context.pending_tool_arguments,
+            next_assistant_sequence=context.next_assistant_sequence,
+            pending_tool_calls=context.pending_tool_calls,
             final_message_id=context.final_message_id,
             final_message_content=context.final_message_content,
             state=context.state,

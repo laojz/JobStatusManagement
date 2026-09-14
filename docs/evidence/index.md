@@ -23,6 +23,7 @@ provider compatibility.
 | [req-ops05-rollback-procedure.md](req-ops05-rollback-procedure.md) | Rollback procedure and rehearsal boundary | 2026-09-13 | Control defined; approved artifacts and drill open |
 | [req-ops06-monitoring-runbook-matrix.md](req-ops06-monitoring-runbook-matrix.md) | Monitoring and operational response matrix | 2026-09-13 | Control defined; monitoring platform and alert drill open |
 | [final-gate-2026-09-13.md](final-gate-2026-09-13.md) | Final current-worktree non-QQ gate results and blockers | 2026-09-13 | Local evidence recorded; external gates remain open |
+| [deployed-functional-flow-2026-09-14.md](deployed-functional-flow-2026-09-14.md) | Deployed public surface and complete functional-flow validation procedure/execution record | 2026-09-14 | Procedure recorded; fresh live execution required |
 
 ## Evidence classes
 

@@ -47,6 +47,7 @@ class FakeLLM(RecordingFake):
 
     analysis: JobMailAnalysisInput | None = None
     conversation_responses: list[ConversationResponse] = field(default_factory=list)
+    conversation_prompts: list[ConversationPrompt] = field(default_factory=list)
 
     def analyze_job_mail(self, prompt: str) -> JobMailAnalysisInput:
         """Record and return a configured typed analysis."""
@@ -58,6 +59,7 @@ class FakeLLM(RecordingFake):
     def converse(self, prompt: ConversationPrompt) -> ConversationResponse:
         """Record and return the next configured conversation response."""
         self.record("converse", prompt.user_message)
+        self.conversation_prompts.append(prompt)
         if not self.conversation_responses:
             raise FakeConfigurationError
         return self.conversation_responses.pop(0)

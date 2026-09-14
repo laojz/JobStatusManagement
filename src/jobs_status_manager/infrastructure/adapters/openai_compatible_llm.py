@@ -11,6 +11,8 @@ from pydantic import AnyHttpUrl, SecretStr, TypeAdapter, ValidationError
 from jobs_status_manager.agent.contracts import (
     ConversationPrompt,
     ConversationResponse,
+    PromptToolCall,
+    PromptToolResult,
     ToolCallRequest,
 )
 from jobs_status_manager.agent.tools import TOOL_ARGUMENT_MODELS, definitions
@@ -114,9 +116,81 @@ def _conversation_messages(prompt: ConversationPrompt) -> list[JsonValue]:
             raise LLMContractError(CONVERSATION_KIND)
         messages.append({"role": item.role, "content": item.content[:12000]})
     messages.append({"role": "user", "content": prompt.user_message[:12000]})
+    messages.extend(_continuation_messages(prompt.tool_calls, prompt.tool_results))
+    return messages
+
+
+def _continuation_messages(
+    calls: tuple[PromptToolCall, ...],
+    results: tuple[PromptToolResult, ...],
+) -> list[JsonValue]:
+    if not calls and not results:
+        return []
+    internal_ids = [call.internal_tool_call_id for call in calls]
+    provider_ids = [call.provider_call_id for call in calls]
+    sequences = [call.sequence for call in calls]
+    assistant_sequences = list(dict.fromkeys(call.assistant_sequence for call in calls))
+    result_ids = [result.internal_tool_call_id for result in results]
+    if (
+        len(set(internal_ids)) != len(internal_ids)
+        or len(set(provider_ids)) != len(provider_ids)
+        or len(set(sequences)) != len(sequences)
+        or len(set(result_ids)) != len(result_ids)
+        or set(result_ids) != set(internal_ids)
+        or sequences != list(range(1, len(calls) + 1))
+        or assistant_sequences != list(range(1, len(assistant_sequences) + 1))
+    ):
+        raise LLMContractError(CONVERSATION_KIND)
+    result_by_call_id = {result.internal_tool_call_id: result for result in results}
+    messages: list[JsonValue] = []
+    group: list[PromptToolCall] = []
+    assistant_sequence: int | None = None
+    for call in calls:
+        try:
+            decoded = json.loads(call.arguments_json)
+        except (TypeError, ValueError):
+            raise LLMContractError(CONVERSATION_KIND) from None
+        if (
+            not isinstance(decoded, dict)
+            or call.name not in TOOL_ARGUMENT_MODELS
+            or not call.provider_call_id.strip()
+        ):
+            raise LLMContractError(CONVERSATION_KIND)
+        if assistant_sequence is not None and call.assistant_sequence != assistant_sequence:
+            messages.extend(_assistant_tool_messages(group, result_by_call_id))
+            group = []
+        assistant_sequence = call.assistant_sequence
+        group.append(call)
+    messages.extend(_assistant_tool_messages(group, result_by_call_id))
+    return messages
+
+
+def _assistant_tool_messages(
+    calls: list[PromptToolCall],
+    result_by_call_id: dict[str, PromptToolResult],
+) -> list[JsonValue]:
+    if not calls:
+        return []
+    messages: list[JsonValue] = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": call.provider_call_id,
+                    "type": call.provider_type,
+                    "function": {"name": call.name, "arguments": call.arguments_json},
+                }
+                for call in calls
+            ],
+        }
+    ]
     messages.extend(
-        {"role": "tool", "tool_call_id": item.tool_call_id, "content": item.data[:12000]}
-        for item in prompt.tool_results
+        {
+            "role": "tool",
+            "tool_call_id": call.provider_call_id,
+            "content": result_by_call_id[call.internal_tool_call_id].data,
+        }
+        for call in calls
     )
     return messages
 
@@ -141,26 +215,41 @@ def _parse_tool_response(message: _Message) -> ConversationResponse:
         if message.tool_calls:
             raise LLMContractError(CONVERSATION_KIND)
         return ConversationResponse(answer=message.content)
-    if len(message.tool_calls) != 1:
+    if not message.tool_calls:
         raise LLMContractError(CONVERSATION_KIND)
-    call = message.tool_calls[0]
-    if not call.id or call.type != "function" or call.function.name not in TOOL_ARGUMENT_MODELS:
-        raise LLMContractError(CONVERSATION_KIND)
-    try:
-        decoded = json.loads(call.function.arguments)
-    except (TypeError, ValueError):
-        raise LLMContractError(CONVERSATION_KIND) from None
-    if not isinstance(decoded, dict):
-        raise LLMContractError(CONVERSATION_KIND)
-    try:
-        arguments = TypeAdapter(ToolArguments).validate_python(decoded, strict=True)
-        tool_call = ToolCallRequest.model_validate(
-            {"name": call.function.name, "arguments": arguments, "tool_call_id": call.id},
-            strict=True,
-        )
-    except (TypeError, ValueError, ValidationError):
-        raise LLMContractError(CONVERSATION_KIND) from None
-    return ConversationResponse(tool_call=tool_call)
+    provider_ids: set[str] = set()
+    tool_calls: list[ToolCallRequest] = []
+    for call in message.tool_calls:
+        if (
+            not call.id.strip()
+            or call.id in provider_ids
+            or call.type != "function"
+            or call.function.name not in TOOL_ARGUMENT_MODELS
+        ):
+            raise LLMContractError(CONVERSATION_KIND)
+        try:
+            decoded = json.loads(call.function.arguments)
+        except (TypeError, ValueError):
+            raise LLMContractError(CONVERSATION_KIND) from None
+        if not isinstance(decoded, dict):
+            raise LLMContractError(CONVERSATION_KIND)
+        try:
+            arguments = TypeAdapter(ToolArguments).validate_python(decoded, strict=True)
+            tool_call = ToolCallRequest.model_validate(
+                {
+                    "provider_call_id": call.id,
+                    "provider_type": call.type,
+                    "name": call.function.name,
+                    "arguments": arguments,
+                    "arguments_json": call.function.arguments,
+                },
+                strict=True,
+            )
+        except (TypeError, ValueError, ValidationError):
+            raise LLMContractError(CONVERSATION_KIND) from None
+        provider_ids.add(call.id)
+        tool_calls.append(tool_call)
+    return ConversationResponse(tool_calls=tuple(tool_calls))
 
 
 class OpenAICompatibleLLM:

@@ -42,6 +42,6 @@ def test_direct_alembic_commands_use_explicit_application_database_target(tmp_pa
     assert upgrade.returncode == 0, upgrade.stderr
     assert check.returncode == 0, check.stderr
     assert current.returncode == 0, current.stderr
-    assert "0008_qq_reply_targets (head)" in current.stdout
+    assert "0009_tool_call_provider_metadata (head)" in current.stdout
     assert database_path.exists()
     assert not (tmp_path / "jobs_status_alembic.db").exists()

@@ -5,7 +5,7 @@ import httpx2
 import pytest
 from pydantic import SecretStr
 
-from jobs_status_manager.agent.contracts import ConversationPrompt, PromptToolResult
+from jobs_status_manager.agent.contracts import ConversationPrompt
 from jobs_status_manager.application_core.domain import ApplicationStatus
 from jobs_status_manager.infrastructure.adapters.openai_compatible_llm import (
     JsonValue,
@@ -218,24 +218,53 @@ def test_conversation_preserves_tool_result_identity_and_registry_tools() -> Non
         seen.append(request)
         return httpx2.Response(200, json={"choices": [{"message": {"content": "answer"}}]})
 
-    prompt = ConversationPrompt(
-        session_summary="summary",
-        active_application_id="app-1",
-        user_message="where?",
-        recent_messages=(),
-        tool_results=(PromptToolResult(tool_call_id="call-1", data='{"ok":true}'),),
+    prompt = ConversationPrompt.model_validate(
+        {
+            "session_summary": "summary",
+            "active_application_id": "app-1",
+            "user_message": "where?",
+            "recent_messages": (),
+            "tool_calls": (
+                {
+                    "internal_tool_call_id": "internal-call-1",
+                    "provider_call_id": "provider-call-1",
+                    "provider_type": "function",
+                    "name": "SearchApplications",
+                    "arguments_json": "{}",
+                    "assistant_sequence": 1,
+                    "sequence": 1,
+                },
+            ),
+            "tool_results": (
+                {
+                    "internal_tool_call_id": "internal-call-1",
+                    "data": "[]",
+                },
+            ),
+        }
     )
     adapter = _adapter(handler)
     result = adapter.converse(prompt)
 
     assert result.answer == "answer"
     payload = json.loads(seen[0].content)
-    assert payload["messages"][0]["role"] == "system"
-    assert payload["messages"][-1] == {
-        "role": "tool",
-        "tool_call_id": "call-1",
-        "content": '{"ok":true}',
-    }
+    assert payload["messages"] == [
+        {"role": "system", "content": prompt.system_prompt},
+        {"role": "system", "content": "session_summary: summary"},
+        {"role": "system", "content": "active_application_id: app-1"},
+        {"role": "user", "content": "where?"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "provider-call-1",
+                    "type": "function",
+                    "function": {"name": "SearchApplications", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "provider-call-1", "content": "[]"},
+    ]
     assert payload["tools"][0]["type"] == "function"
     assert payload["tools"][0]["function"]["parameters"]["type"] == "object"
     assert payload["tool_choice"] == "auto"
@@ -266,9 +295,216 @@ def test_conversation_parses_one_function_call() -> None:
     adapter = _adapter(handler)
     result = adapter.converse(ConversationPrompt(user_message="recent mails"))
 
-    assert result.tool_call is not None
-    assert result.tool_call.name == "GetRecentMails"
-    assert result.tool_call.arguments == {}
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].name == "GetRecentMails"
+    assert result.tool_calls[0].arguments == {}
+
+
+def test_conversation_preserves_provider_tool_call_identity() -> None:
+    arguments_json = '{ "company" : "Acme" }'
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "provider-call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "SearchApplications",
+                                        "arguments": arguments_json,
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    result = _adapter(handler).converse(ConversationPrompt(user_message="applications"))
+
+    assert result.tool_calls[0].provider_call_id == "provider-call-1"
+    assert result.tool_calls[0].arguments_json == arguments_json
+
+
+def test_conversation_parses_multiple_provider_tool_calls_in_order() -> None:
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "id": "provider-call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "SearchApplications",
+                                        "arguments": "{}",
+                                    },
+                                },
+                                {
+                                    "id": "provider-call-2",
+                                    "type": "function",
+                                    "function": {"name": "GetRecentMails", "arguments": "{}"},
+                                },
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    result = _adapter(handler).converse(ConversationPrompt(user_message="status"))
+
+    assert [call.model_dump()["provider_call_id"] for call in result.tool_calls] == [
+        "provider-call-1",
+        "provider-call-2",
+    ]
+
+
+def test_conversation_reconstructs_ordered_multi_tool_batch_with_matching_results() -> None:
+    seen: list[httpx2.Request] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        return httpx2.Response(200, json={"choices": [{"message": {"content": "answer"}}]})
+
+    prompt = ConversationPrompt.model_validate(
+        {
+            "user_message": "status",
+            "tool_calls": (
+                {
+                    "internal_tool_call_id": "internal-1",
+                    "provider_call_id": "provider-1",
+                    "provider_type": "function",
+                    "name": "SearchApplications",
+                    "arguments_json": "{}",
+                    "assistant_sequence": 1,
+                    "sequence": 1,
+                },
+                {
+                    "internal_tool_call_id": "internal-2",
+                    "provider_call_id": "provider-2",
+                    "provider_type": "function",
+                    "name": "GetRecentMails",
+                    "arguments_json": "{}",
+                    "assistant_sequence": 1,
+                    "sequence": 2,
+                },
+            ),
+            "tool_results": (
+                {"internal_tool_call_id": "internal-1", "data": "[]"},
+                {"internal_tool_call_id": "internal-2", "data": '{"count":0}'},
+            ),
+        }
+    )
+
+    result = _adapter(handler).converse(prompt)
+
+    assert result.answer == "answer"
+    payload = json.loads(seen[0].content)
+    assert payload["messages"][-3:] == [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "provider-1",
+                    "type": "function",
+                    "function": {"name": "SearchApplications", "arguments": "{}"},
+                },
+                {
+                    "id": "provider-2",
+                    "type": "function",
+                    "function": {"name": "GetRecentMails", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "provider-1", "content": "[]"},
+        {"role": "tool", "tool_call_id": "provider-2", "content": '{"count":0}'},
+    ]
+
+
+@pytest.mark.parametrize(
+    "prompt_data",
+    [
+        {
+            "user_message": "status",
+            "tool_calls": (
+                {
+                    "internal_tool_call_id": "internal-1",
+                    "provider_call_id": "duplicate",
+                    "provider_type": "function",
+                    "name": "SearchApplications",
+                    "arguments_json": "{}",
+                    "assistant_sequence": 1,
+                    "sequence": 1,
+                },
+                {
+                    "internal_tool_call_id": "internal-2",
+                    "provider_call_id": "duplicate",
+                    "provider_type": "function",
+                    "name": "GetRecentMails",
+                    "arguments_json": "{}",
+                    "assistant_sequence": 1,
+                    "sequence": 2,
+                },
+            ),
+            "tool_results": (
+                {"internal_tool_call_id": "internal-1", "data": "[]"},
+                {"internal_tool_call_id": "internal-2", "data": "[]"},
+            ),
+        },
+        {
+            "user_message": "status",
+            "tool_calls": (
+                {
+                    "internal_tool_call_id": "internal-1",
+                    "provider_call_id": "provider-1",
+                    "provider_type": "function",
+                    "name": "SearchApplications",
+                    "arguments_json": "{}",
+                    "assistant_sequence": 1,
+                    "sequence": 1,
+                },
+            ),
+            "tool_results": ({"internal_tool_call_id": "unknown-internal", "data": "[]"},),
+        },
+        {
+            "user_message": "status",
+            "tool_calls": (
+                {
+                    "internal_tool_call_id": "internal-1",
+                    "provider_call_id": "provider-1",
+                    "provider_type": "function",
+                    "name": "SearchApplications",
+                    "arguments_json": "{}",
+                    "assistant_sequence": 1,
+                    "sequence": 2,
+                },
+            ),
+            "tool_results": ({"internal_tool_call_id": "internal-1", "data": "[]"},),
+        },
+    ],
+)
+def test_conversation_rejects_unreconstructable_continuation(
+    prompt_data: dict[str, JsonValue | tuple[JsonValue, ...]],
+) -> None:
+    adapter = _adapter(
+        lambda request: httpx2.Response(
+            200,
+            json={"choices": [{"message": {"content": "must not be requested"}}]},
+        )
+    )
+
+    with pytest.raises(LLMContractError):
+        adapter.converse(ConversationPrompt.model_validate(prompt_data))
 
 
 @pytest.mark.parametrize(

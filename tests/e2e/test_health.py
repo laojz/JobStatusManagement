@@ -33,7 +33,7 @@ def test_health_startup_and_shutdown(settings: AppSettings) -> None:
             "status": "ready",
             "phase": "6",
             "database": "ok",
-            "schema_version": "0008_qq_reply_targets",
+            "schema_version": "0009_tool_call_provider_metadata",
             "readiness": "ready",
             "durable_tasks": "ok",
             "failed_tasks": 0,

@@ -227,7 +227,10 @@ def test_phase_one_migration_and_foreign_keys(database: Database, settings: AppS
     """The real migration creates all Phase 1 tables and keeps FK enforcement."""
     root = Path(__file__).resolve().parents[2]
     upgrade_database(root, f"sqlite:///{settings.database_path}")
-    assert current_revision(f"sqlite:///{settings.database_path}") == "0008_qq_reply_targets"
+    assert (
+        current_revision(f"sqlite:///{settings.database_path}")
+        == "0009_tool_call_provider_metadata"
+    )
     with database.engine.connect() as connection:
         names = set(
             connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'")).scalars()

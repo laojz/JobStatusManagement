@@ -169,6 +169,10 @@ def test_composite_agent_run_persists_ordered_results_and_replays_after_restart(
                 agent_run_id="composite-run",
                 tool_name="SearchApplications",
                 arguments={"company": "Example Corp"},
+                provider_call_id="provider-application-call",
+                provider_type="function",
+                provider_arguments_json='{"company":"Example Corp"}',
+                assistant_sequence=1,
                 sequence=1,
                 created_at=fake_clock.now(),
             )
@@ -177,10 +181,21 @@ def test_composite_agent_run_persists_ordered_results_and_replays_after_restart(
     restarted = Database(settings.database_path)
     llm = FakeLLM(
         conversation_responses=[
-            ConversationResponse(tool_call=ToolCallRequest(name="GetRecentMails")),
             ConversationResponse(
-                tool_call=ToolCallRequest(
-                    name="SearchKnowledge", arguments={"query": "distributed systems"}
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-mail-call",
+                        provider_type="function",
+                        name="GetRecentMails",
+                        arguments_json="{}",
+                    ),
+                    ToolCallRequest(
+                        provider_call_id="provider-knowledge-call",
+                        provider_type="function",
+                        name="SearchKnowledge",
+                        arguments={"query": "distributed systems"},
+                        arguments_json='{"query":"distributed systems"}',
+                    ),
                 )
             ),
             ConversationResponse(answer="综合查询完成"),
@@ -232,7 +247,12 @@ def test_composite_agent_run_persists_ordered_results_and_replays_after_restart(
     assert all(row.error is None and row.data for row in results)
     assert json.loads(context_refs)["knowledge_document_id"] == document_id
     assert run == (AgentRunState.COMPLETED.value, "SENT")
-    assert llm.calls == [("converse", ("请综合查询",))] * 3
+    assert llm.calls == [("converse", ("请综合查询",))] * 2
+    assert [call.provider_call_id for call in llm.conversation_prompts[1].tool_calls] == [
+        "provider-application-call",
+        "provider-mail-call",
+        "provider-knowledge-call",
+    ]
     assert [call[0] for call in qq.calls] == ["deliver"]
 
 

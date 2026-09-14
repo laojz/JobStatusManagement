@@ -35,7 +35,7 @@ def test_migrations_pragmas_and_identity_bootstrap(
     url = f"sqlite:///{settings.database_path}"
     upgrade_database(root, url)
     upgrade_database(root, url)
-    assert current_revision(url) == "0008_qq_reply_targets"
+    assert current_revision(url) == "0009_tool_call_provider_metadata"
     assert database.pragmas() == {
         "foreign_keys": "1",
         "journal_mode": "wal",
@@ -133,7 +133,7 @@ def test_phase_six_migration_round_trip_preserves_run_timing(
     command.downgrade(migration_config(root, url), "0006_phase5_rag")
     assert current_revision(url) == "0006_phase5_rag"
     command.upgrade(migration_config(root, url), "head")
-    assert current_revision(url) == "0008_qq_reply_targets"
+    assert current_revision(url) == "0009_tool_call_provider_metadata"
     with database.engine.connect() as connection:
         run = connection.execute(
             text("SELECT started_at, attempt_count, next_retry_at FROM agent_runs WHERE id='run'")
@@ -206,7 +206,7 @@ def test_qq_reply_target_migration_round_trip_preserves_event_identity(
     command.downgrade(migration_config(root, url), "0007_phase6_reliability")
     assert current_revision(url) == "0007_phase6_reliability"
     command.upgrade(migration_config(root, url), "head")
-    assert current_revision(url) == "0008_qq_reply_targets"
+    assert current_revision(url) == "0009_tool_call_provider_metadata"
     with database.engine.begin() as connection:
         columns = {
             row[1] for row in connection.execute(text("PRAGMA table_info('conversation_messages')"))
@@ -226,3 +226,92 @@ def test_qq_reply_target_migration_round_trip_preserves_event_identity(
             )
         ).one()
         assert row == ("event", None, None, None, None, None)
+
+
+def test_tool_call_provider_metadata_migration_preserves_legacy_rows(
+    database: Database, settings: AppSettings
+) -> None:
+    root = Path(__file__).resolve().parents[2]
+    url = f"sqlite:///{settings.database_path}"
+    upgrade_database(root, url)
+    command.downgrade(migration_config(root, url), "0008_qq_reply_targets")
+    assert current_revision(url) == "0008_qq_reply_targets"
+    with database.engine.begin() as connection:
+        now = "2026-01-01T00:00:00+00:00"
+        connection.execute(
+            text(
+                "INSERT INTO users (id, external_key, display_name, created_at, updated_at) "
+                "VALUES ('user', 'key', 'name', :now, :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, user_id, session_type, summary, created_at, "
+                "last_active_at, updated_at) VALUES "
+                "('session', 'user', 'MAIN', '', :now, :now, :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO conversation_messages "
+                "(id, session_id, role, content, created_at) "
+                "VALUES ('message', 'session', 'user', 'hello', :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO agent_runs (id, session_id, user_message_id, state, created_at) "
+                "VALUES ('run', 'session', 'message', 'RUNNING', :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO tool_calls "
+                "(id, agent_run_id, tool_name, arguments, sequence, created_at) "
+                "VALUES ('internal-call', 'run', 'SearchApplications', '{}', 1, :now)"
+            ),
+            {"now": now},
+        )
+
+    command.upgrade(migration_config(root, url), "0009_tool_call_provider_metadata")
+
+    assert current_revision(url) == "0009_tool_call_provider_metadata"
+    with database.engine.connect() as connection:
+        columns = {row[1] for row in connection.execute(text("PRAGMA table_info('tool_calls')"))}
+        assert {
+            "provider_call_id",
+            "provider_type",
+            "provider_arguments_json",
+            "assistant_sequence",
+        } <= columns
+        row = connection.execute(
+            text(
+                "SELECT id, provider_call_id, provider_type, provider_arguments_json, "
+                "assistant_sequence FROM tool_calls WHERE id='internal-call'"
+            )
+        ).one()
+    assert row == ("internal-call", None, None, None, None)
+
+    command.downgrade(migration_config(root, url), "0008_qq_reply_targets")
+    assert current_revision(url) == "0008_qq_reply_targets"
+    with database.engine.connect() as connection:
+        downgraded_columns = {
+            row[1] for row in connection.execute(text("PRAGMA table_info('tool_calls')"))
+        }
+        legacy_row = connection.execute(
+            text("SELECT id, tool_name, arguments, sequence FROM tool_calls")
+        ).one()
+    assert (
+        not {
+            "provider_call_id",
+            "provider_type",
+            "provider_arguments_json",
+            "assistant_sequence",
+        }
+        & downgraded_columns
+    )
+    assert legacy_row == ("internal-call", "SearchApplications", "{}", 1)

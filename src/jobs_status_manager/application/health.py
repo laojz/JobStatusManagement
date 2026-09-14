@@ -10,7 +10,7 @@ from starlette.responses import JSONResponse, Response
 from jobs_status_manager.application.operations import list_tasks
 from jobs_status_manager.infrastructure.database.migrations import current_revision
 
-HEAD_REVISION: Final = "0008_qq_reply_targets"
+HEAD_REVISION: Final = "0009_tool_call_provider_metadata"
 
 
 class HealthPayload(TypedDict):

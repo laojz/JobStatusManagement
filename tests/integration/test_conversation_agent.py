@@ -215,6 +215,212 @@ def test_baseline_answer_completion_persists_terminal_delivery_state(
     assert delivery_state == "SENT"
 
 
+def test_runtime_persists_provider_tool_metadata_before_continuation(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=False)
+    llm = FakeLLM(
+        conversation_responses=[
+            ConversationResponse(
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-call-1",
+                        provider_type="function",
+                        name="SearchApplications",
+                        arguments={},
+                        arguments_json="{}",
+                    ),
+                )
+            ),
+            ConversationResponse(answer="没有申请记录"),
+        ]
+    )
+
+    process_run(
+        RuntimeServices(
+            database,
+            llm,
+            FakeQQGateway(),
+            fake_clock,
+            _ids(),
+            tool_executor=lambda *_: ToolExecution("[]", {}),
+        ),
+        "runtime-run",
+    )
+
+    with database.engine.connect() as connection:
+        row = connection.execute(
+            text(
+                "SELECT id, provider_call_id, provider_type, provider_arguments_json "
+                "FROM tool_calls"
+            )
+        ).one()
+        result_data = connection.execute(text("SELECT data FROM tool_results")).scalar_one()
+    assert row.id != row.provider_call_id
+    assert row.provider_call_id == "provider-call-1"
+    assert row.provider_type == "function"
+    assert row.provider_arguments_json == "{}"
+    assert result_data == "[]"
+    assert llm.conversation_prompts[1].tool_results[0].data == "[]"
+    assert llm.conversation_prompts[1].tool_calls[0].provider_call_id == "provider-call-1"
+
+
+def test_runtime_executes_and_reconstructs_complete_multi_tool_batch_in_provider_order(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=False)
+    execution_order: list[str] = []
+
+    def execute_batch(
+        _database: Database,
+        _user_id: str,
+        name: str,
+        _arguments: dict[str, str | int | bool | None],
+    ) -> ToolExecution:
+        execution_order.append(name)
+        return ToolExecution("[]" if name == "SearchApplications" else '{"mails":[]}', {})
+
+    llm = FakeLLM(
+        conversation_responses=[
+            ConversationResponse(
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-call-1",
+                        provider_type="function",
+                        name="SearchApplications",
+                        arguments_json="{}",
+                    ),
+                    ToolCallRequest(
+                        provider_call_id="provider-call-2",
+                        provider_type="function",
+                        name="GetRecentMails",
+                        arguments_json="{}",
+                    ),
+                )
+            ),
+            ConversationResponse(answer="查询完成"),
+        ]
+    )
+
+    process_run(
+        RuntimeServices(
+            database,
+            llm,
+            FakeQQGateway(),
+            fake_clock,
+            _ids(),
+            tool_executor=execute_batch,
+        ),
+        "runtime-run",
+    )
+
+    continuation = llm.conversation_prompts[1]
+    assert execution_order == ["SearchApplications", "GetRecentMails"]
+    assert [call.provider_call_id for call in continuation.tool_calls] == [
+        "provider-call-1",
+        "provider-call-2",
+    ]
+    assert [result.data for result in continuation.tool_results] == ["[]", '{"mails":[]}']
+    with database.engine.connect() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT provider_call_id, assistant_sequence, sequence FROM tool_calls "
+                "ORDER BY sequence"
+            )
+        ).all()
+    assert rows == [("provider-call-1", 1, 1), ("provider-call-2", 1, 2)]
+
+
+def test_runtime_restart_resumes_partial_batch_without_reexecution_or_redelivery(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+) -> None:
+    user_id = _setup(database, settings, fake_clock)
+    _seed_runtime_run(database, user_id, fake_clock.now().isoformat(), provider_metadata=False)
+    now = fake_clock.now().isoformat()
+    with database.engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO tool_calls "
+                "(id, agent_run_id, tool_name, arguments, provider_call_id, provider_type, "
+                "provider_arguments_json, assistant_sequence, sequence, created_at) "
+                "VALUES ('internal-call', 'runtime-run', 'SearchApplications', '{}', "
+                "'provider-call', 'function', '{}', 1, 1, :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO tool_calls "
+                "(id, agent_run_id, tool_name, arguments, provider_call_id, provider_type, "
+                "provider_arguments_json, assistant_sequence, sequence, created_at) "
+                "VALUES ('pending-call', 'runtime-run', 'GetRecentMails', '{}', "
+                "'provider-pending', 'function', '{}', 1, 2, :now)"
+            ),
+            {"now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO tool_results "
+                "(id, tool_call_id, data, context_refs, error, started_at, completed_at, "
+                "created_at) VALUES ('result', 'internal-call', '[]', '{}', NULL, :now, :now, :now)"
+            ),
+            {"now": now},
+        )
+    database.dispose()
+    restarted = Database(settings.database_path)
+    executions: list[str] = []
+
+    def execute_pending_tool(
+        _database: Database,
+        _user_id: str,
+        name: str,
+        _arguments: dict[str, str | int | bool | None],
+    ) -> ToolExecution:
+        executions.append(name)
+        return ToolExecution('{"mails":[]}', {})
+
+    llm = FakeLLM(conversation_responses=[ConversationResponse(answer="没有申请记录")])
+    qq = FakeQQGateway()
+    try:
+        services = RuntimeServices(
+            restarted,
+            llm,
+            qq,
+            fake_clock,
+            _ids(),
+            tool_executor=execute_pending_tool,
+        )
+        process_run(services, "runtime-run")
+        process_run(services, "runtime-run")
+        with restarted.engine.connect() as connection:
+            run = connection.execute(
+                text("SELECT state, delivery_state FROM agent_runs WHERE id='runtime-run'")
+            ).one()
+    finally:
+        restarted.dispose()
+
+    assert executions == ["GetRecentMails"]
+    assert len(llm.conversation_prompts) == 1
+    assert [call.provider_call_id for call in llm.conversation_prompts[0].tool_calls] == [
+        "provider-call",
+        "provider-pending",
+    ]
+    assert [result.data for result in llm.conversation_prompts[0].tool_results] == [
+        "[]",
+        '{"mails":[]}',
+    ]
+    assert [call[0] for call in qq.calls] == ["push"]
+    assert run == (AgentRunState.COMPLETED.value, "SENT")
+
+
 def test_runtime_delivers_final_answer_to_persisted_passive_target(
     database: Database,
     settings: AppSettings,
@@ -766,8 +972,17 @@ def test_runtime_rejects_ninth_tool_and_forbidden_write(
     llm = FakeLLM(
         conversation_responses=[
             *[
-                ConversationResponse(tool_call=ToolCallRequest(name="SearchApplications"))
-                for _ in range(9)
+                ConversationResponse(
+                    tool_calls=(
+                        ToolCallRequest(
+                            provider_call_id=f"provider-call-{index}",
+                            provider_type="function",
+                            name="SearchApplications",
+                            arguments_json="{}",
+                        ),
+                    )
+                )
+                for index in range(9)
             ],
         ]
     )
@@ -785,13 +1000,18 @@ def test_runtime_rejects_ninth_tool_and_forbidden_write(
     write = FakeLLM(
         conversation_responses=[
             ConversationResponse(
-                tool_call=ToolCallRequest(
-                    name="UpdateApplicationStatus",
-                    arguments={
-                        "company": "腾讯",
-                        "position": "后端",
-                        "status": "APPLIED",
-                    },
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-write-1",
+                        provider_type="function",
+                        name="UpdateApplicationStatus",
+                        arguments={
+                            "company": "腾讯",
+                            "position": "后端",
+                            "status": "APPLIED",
+                        },
+                        arguments_json='{"company":"腾讯","position":"后端","status":"APPLIED"}',
+                    ),
                 )
             )
         ]
@@ -813,9 +1033,14 @@ def test_runtime_rejects_ninth_tool_and_forbidden_write(
     malformed = FakeLLM(
         conversation_responses=[
             ConversationResponse(
-                tool_call=ToolCallRequest(
-                    name="UpdateApplicationStatus",
-                    arguments={"company": "腾讯", "position": "后端", "status": "INTERVIEW"},
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-write-2",
+                        provider_type="function",
+                        name="UpdateApplicationStatus",
+                        arguments={"company": "腾讯", "position": "后端", "status": "INTERVIEW"},
+                        arguments_json='{"company":"腾讯","position":"后端","status":"INTERVIEW"}',
+                    ),
                 )
             )
         ]
@@ -866,13 +1091,18 @@ def test_write_proposal_freezes_arguments_and_confirmation_executes_once(
     llm = FakeLLM(
         conversation_responses=[
             ConversationResponse(
-                tool_call=ToolCallRequest(
-                    name="UpdateApplicationStatus",
-                    arguments={
-                        "company": "腾讯",
-                        "position": "后端",
-                        "status": "APPLIED",
-                    },
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-write-3",
+                        provider_type="function",
+                        name="UpdateApplicationStatus",
+                        arguments={
+                            "company": "腾讯",
+                            "position": "后端",
+                            "status": "APPLIED",
+                        },
+                        arguments_json='{"company":"腾讯","position":"后端","status":"APPLIED"}',
+                    ),
                 )
             )
         ]
@@ -921,13 +1151,18 @@ def test_confirmation_event_is_durable_deterministic_and_resumes_original_run(
     proposal_llm = FakeLLM(
         conversation_responses=[
             ConversationResponse(
-                tool_call=ToolCallRequest(
-                    name="UpdateApplicationStatus",
-                    arguments={
-                        "company": "腾讯",
-                        "position": "后端",
-                        "status": "APPLIED",
-                    },
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-write-4",
+                        provider_type="function",
+                        name="UpdateApplicationStatus",
+                        arguments={
+                            "company": "腾讯",
+                            "position": "后端",
+                            "status": "APPLIED",
+                        },
+                        arguments_json='{"company":"腾讯","position":"后端","status":"APPLIED"}',
+                    ),
                 )
             )
         ]
@@ -1014,9 +1249,11 @@ def test_rejection_bypasses_llm_and_leaves_facts_unchanged(
         )
         connection.execute(
             text(
-                "INSERT INTO tool_calls (id, agent_run_id, tool_name, arguments, sequence, "
-                "created_at) "
-                "VALUES ('call', 'run', 'UpdateApplicationStatus', :arguments, 1, :now)"
+                "INSERT INTO tool_calls "
+                "(id, agent_run_id, tool_name, arguments, provider_call_id, provider_type, "
+                "provider_arguments_json, assistant_sequence, sequence, created_at) "
+                "VALUES ('call', 'run', 'UpdateApplicationStatus', :arguments, 'provider-call', "
+                "'function', :arguments, 1, 1, :now)"
             ),
             {
                 "arguments": '{"company":"腾讯","position":"后端","status":"APPLIED"}',
@@ -1110,8 +1347,11 @@ def test_confirmed_action_recovery_resumes_original_run_after_restart(
     with database.engine.begin() as connection:
         connection.execute(
             text(
-                "INSERT INTO tool_calls (id, agent_run_id, tool_name, arguments, sequence, "
-                "created_at) VALUES ('call', 'run', 'UpdateApplicationStatus', :arguments, 1, :now)"
+                "INSERT INTO tool_calls "
+                "(id, agent_run_id, tool_name, arguments, provider_call_id, provider_type, "
+                "provider_arguments_json, assistant_sequence, sequence, created_at) "
+                "VALUES ('call', 'run', 'UpdateApplicationStatus', :arguments, 'provider-call', "
+                "'function', :arguments, 1, 1, :now)"
             ),
             {
                 "arguments": '{"company":"腾讯","position":"后端","status":"APPLIED"}',
@@ -1184,8 +1424,10 @@ def test_pending_write_tool_call_recovers_without_llm_and_delivers_once(
         connection.execute(
             text(
                 "INSERT INTO tool_calls "
-                "(id, agent_run_id, tool_name, arguments, sequence, created_at) "
-                "VALUES ('call', 'run', 'UpdateApplicationStatus', :arguments, 1, :now)"
+                "(id, agent_run_id, tool_name, arguments, provider_call_id, provider_type, "
+                "provider_arguments_json, assistant_sequence, sequence, created_at) "
+                "VALUES ('call', 'run', 'UpdateApplicationStatus', :arguments, 'provider-call', "
+                "'function', :arguments, 1, 1, :now)"
             ),
             {
                 "arguments": '{"company":"腾讯","position":"后端","status":"APPLIED"}',
@@ -1247,9 +1489,14 @@ def test_confirmation_prompt_delivery_failure_is_persisted_and_retried(
     llm = FakeLLM(
         conversation_responses=[
             ConversationResponse(
-                tool_call=ToolCallRequest(
-                    name="UpdateApplicationStatus",
-                    arguments={"company": "腾讯", "position": "后端", "status": "APPLIED"},
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-write-5",
+                        provider_type="function",
+                        name="UpdateApplicationStatus",
+                        arguments={"company": "腾讯", "position": "后端", "status": "APPLIED"},
+                        arguments_json='{"company":"腾讯","position":"后端","status":"APPLIED"}',
+                    ),
                 )
             )
         ]
@@ -1342,8 +1589,10 @@ def test_terminal_action_reconciliation_is_idempotent(
         connection.execute(
             text(
                 "INSERT INTO tool_calls "
-                "(id, agent_run_id, tool_name, arguments, sequence, created_at) "
-                "VALUES ('call', 'run', 'UpdateApplicationStatus', :arguments, 1, :now)"
+                "(id, agent_run_id, tool_name, arguments, provider_call_id, provider_type, "
+                "provider_arguments_json, assistant_sequence, sequence, created_at) "
+                "VALUES ('call', 'run', 'UpdateApplicationStatus', :arguments, 'provider-call', "
+                "'function', :arguments, 1, 1, :now)"
             ),
             {
                 "arguments": '{"company":"腾讯","position":"后端","status":"APPLIED"}',
@@ -1531,7 +1780,16 @@ def test_tool_timeout_and_result_limit_are_durable(
 
     slow_llm = FakeLLM(
         conversation_responses=[
-            ConversationResponse(tool_call=ToolCallRequest(name="SearchApplications")),
+            ConversationResponse(
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-slow",
+                        provider_type="function",
+                        name="SearchApplications",
+                        arguments_json="{}",
+                    ),
+                )
+            ),
         ]
     )
     process_run(
@@ -1560,7 +1818,16 @@ def test_tool_timeout_and_result_limit_are_durable(
         )
     oversized_llm = FakeLLM(
         conversation_responses=[
-            ConversationResponse(tool_call=ToolCallRequest(name="SearchApplications")),
+            ConversationResponse(
+                tool_calls=(
+                    ToolCallRequest(
+                        provider_call_id="provider-oversized",
+                        provider_type="function",
+                        name="SearchApplications",
+                        arguments_json="{}",
+                    ),
+                )
+            ),
         ]
     )
     process_run(

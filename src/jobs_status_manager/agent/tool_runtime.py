@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 import anyio
 
+from jobs_status_manager.agent.contracts import PromptToolCall, ToolCallRequest
 from jobs_status_manager.agent.models import ToolCall, ToolResult
 from jobs_status_manager.infrastructure.database.transactions import transaction
 from jobs_status_manager.infrastructure.safe_errors import safe_external_error
@@ -19,27 +20,43 @@ if TYPE_CHECKING:
     from jobs_status_manager.agent.write_contracts import ToolExecution
 
 
-def persist_tool_call(
+def persist_tool_calls(
     services: RuntimeServices,
     context: RunContext,
-    sequence: int,
-    name: str,
-    arguments: ToolArguments,
-) -> str:
-    """Persist a tool request before executing its external query."""
-    call_id = str(services.ids.new_id())
+    requests: tuple[ToolCallRequest, ...],
+) -> tuple[PromptToolCall, ...]:
+    """Persist a complete provider assistant tool-call batch before execution."""
+    persisted: list[PromptToolCall] = []
     with transaction(services.database) as session:
-        session.add(
-            ToolCall(
-                id=call_id,
-                agent_run_id=context.run_id,
-                tool_name=name,
-                arguments=arguments,
-                sequence=sequence,
-                created_at=services.clock.now(),
+        for offset, request in enumerate(requests):
+            call_id = str(services.ids.new_id())
+            sequence = context.next_sequence + offset
+            session.add(
+                ToolCall(
+                    id=call_id,
+                    agent_run_id=context.run_id,
+                    tool_name=request.name,
+                    arguments=request.arguments,
+                    provider_call_id=request.provider_call_id,
+                    provider_type=request.provider_type,
+                    provider_arguments_json=request.arguments_json,
+                    assistant_sequence=context.next_assistant_sequence,
+                    sequence=sequence,
+                    created_at=services.clock.now(),
+                )
             )
-        )
-    return call_id
+            persisted.append(
+                PromptToolCall(
+                    internal_tool_call_id=call_id,
+                    provider_call_id=request.provider_call_id,
+                    provider_type=request.provider_type,
+                    name=request.name,
+                    arguments_json=request.arguments_json,
+                    assistant_sequence=context.next_assistant_sequence,
+                    sequence=sequence,
+                )
+            )
+    return tuple(persisted)
 
 
 async def _execute_tool_async(

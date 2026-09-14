@@ -167,7 +167,10 @@ def test_local_recovery_drill_restores_isolated_wal_state_and_rebuilds_index(
         assert check_integrity(restored_database.path, root).ok
         assert _counts(restored_database.path) == source_counts
         assert restored_upload.read_bytes() == upload_path.read_bytes()
-        assert current_revision(f"sqlite:///{restored_database.path}") == "0008_qq_reply_targets"
+        assert (
+            current_revision(f"sqlite:///{restored_database.path}")
+            == "0009_tool_call_provider_metadata"
+        )
 
         chroma = LocalChroma(drill_root / "restored" / "chroma")
         summary = rebuild_index(

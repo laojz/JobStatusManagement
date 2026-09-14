@@ -95,6 +95,10 @@ class ToolCall(Base):
     agent_run_id: Mapped[str] = mapped_column(ForeignKey("agent_runs.id"), nullable=False)
     tool_name: Mapped[str] = mapped_column(String(100), nullable=False)
     arguments: Mapped[dict[str, str | int | bool | None]] = mapped_column(JSON, nullable=False)
+    provider_call_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    provider_arguments_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    assistant_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
