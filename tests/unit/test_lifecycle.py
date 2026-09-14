@@ -1,11 +1,16 @@
+from collections.abc import Callable
+
 import anyio
 import pytest
+from structlog.testing import CapturingLogger
 
 from jobs_status_manager.agent.contracts import ConversationResponse
+from jobs_status_manager.application import lifecycle
 from jobs_status_manager.application.lifecycle import (
     LifecycleAdapters,
     _cleanup_lifecycle_resources,
     _readiness_state,
+    _worker_loop,
 )
 from jobs_status_manager.config.settings import AppSettings
 from jobs_status_manager.infrastructure.adapters.fakes import FakeIMAPGateway, FakeLLM
@@ -113,3 +118,35 @@ def test_cleanup_attempts_remaining_resources_after_unexpected_qq_error() -> Non
 
     # Then
     assert events == ["qq", "owned", "database"]
+
+
+def test_imap_worker_logs_lifecycle_without_waiting_for_poll_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cycle_ran = anyio.Event()
+
+    async def run_sync(cycle: Callable[[], None]) -> None:
+        cycle()
+        cycle_ran.set()
+
+    async def run_worker() -> None:
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_worker_loop, "imap-poller", lambda: None)
+            await cycle_ran.wait()
+            task_group.cancel_scope.cancel()
+
+    monkeypatch.setattr(anyio.to_thread, "run_sync", run_sync)
+    capturing_logger = CapturingLogger()
+    monkeypatch.setattr(lifecycle, "logger", capturing_logger)
+
+    anyio.run(run_worker)
+
+    assert [call.method_name for call in capturing_logger.calls] == ["info", "info"]
+    assert [call.args for call in capturing_logger.calls] == [
+        ("imap_poller_started",),
+        ("imap_poller_stopped",),
+    ]
+    assert [call.kwargs for call in capturing_logger.calls] == [
+        {"component": "imap_poller", "interval_seconds": 60, "worker": "imap-poller"},
+        {"component": "imap_poller", "interval_seconds": 60, "worker": "imap-poller"},
+    ]

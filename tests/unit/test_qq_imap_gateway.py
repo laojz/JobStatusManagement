@@ -8,6 +8,7 @@ from jobs_status_manager.infrastructure.adapters.qq_imap import (
     ConnectionOptions,
     Cursor,
     IMAPAuthenticationError,
+    IMAPPhase,
     IMAPProtocolError,
     IMAPTimeoutError,
     QQIMAPConfig,
@@ -16,12 +17,27 @@ from jobs_status_manager.infrastructure.adapters.qq_imap import (
 )
 
 CallArgument = str | tuple[str | bool | None, ...]
+FetchValue = bytes | tuple[bytes, bytes] | None
+
+
+class MalformedFetchTuple(tuple[bytes, bytes]):
+    __slots__ = ()
+
+    def __len__(self) -> int:
+        return 1
 
 
 class FakeConnection:
-    def __init__(self, messages: dict[int, bytes], *, failure: BaseException | None = None) -> None:
+    def __init__(
+        self,
+        messages: dict[int, bytes],
+        *,
+        failure: BaseException | None = None,
+        fetch_values: list[FetchValue] | None = None,
+    ) -> None:
         self.messages = messages
         self.failure = failure
+        self.fetch_values = fetch_values
         self.calls: list[tuple[str, CallArgument]] = []
         self.closed = False
 
@@ -39,7 +55,7 @@ class FakeConnection:
         self.calls.append(("response", code))
         return "UIDVALIDITY", [b"7"]
 
-    def uid(self, command: str, *args: str) -> tuple[str, list[bytes | tuple[bytes, bytes] | None]]:
+    def uid(self, command: str, *args: str) -> tuple[str, list[FetchValue]]:
         self.calls.append((command, args))
         if command == "SEARCH":
             query = args[-1]
@@ -54,6 +70,8 @@ class FakeConnection:
         if command == "FETCH":
             uid = int(args[0])
             metadata = f'{uid} (INTERNALDATE "10-Sep-2024 12:00:00 +0000" RFC822)'.encode()
+            if self.fetch_values is not None:
+                return "OK", self.fetch_values
             return "OK", [(metadata, self.messages[uid])]
         raise AssertionError(command)
 
@@ -124,6 +142,50 @@ def test_poll_fetches_uid_range_in_order_and_bounds_batch() -> None:
     assert result.reset is False
     assert ("SEARCH", ("UID 1:*",)) in connection.calls
     assert ("FETCH", ("1", "(RFC822 INTERNALDATE)")) in connection.calls
+
+
+def test_poll_accepts_fetch_literal_with_standalone_trailer_bytes() -> None:
+    message = _message("accepted literal")
+    metadata = b'1 (INTERNALDATE "10-Sep-2024 12:00:00 +0000" RFC822 {1})'
+    connection = FakeConnection({1: message}, fetch_values=[(metadata, message), b")"])
+    gateway = QQIMAPGateway(_config(), connection_factory=lambda _options: connection)
+
+    result = gateway.poll("internal-account", encode_cursor(Cursor(uidvalidity=7, uid=0)))
+
+    assert [envelope.subject for envelope in result.envelopes] == ["accepted literal"]
+
+
+@pytest.mark.parametrize(
+    "fetch_values",
+    [
+        [b")"],
+        [MalformedFetchTuple((b"metadata", b"message"))],
+    ],
+    ids=["missing-literal", "wrong-tuple-size"],
+)
+def test_poll_rejects_missing_or_malformed_fetch_literal(fetch_values: list[FetchValue]) -> None:
+    connection = FakeConnection({1: _message("rejected")}, fetch_values=fetch_values)
+    gateway = QQIMAPGateway(_config(), connection_factory=lambda _options: connection)
+
+    with pytest.raises(IMAPProtocolError) as caught:
+        gateway.poll("internal-account", encode_cursor(Cursor(uidvalidity=7, uid=0)))
+
+    assert caught.value.phase is IMAPPhase.FETCH
+
+
+def test_poll_rejects_ambiguous_fetch_literals() -> None:
+    message = _message("ambiguous")
+    metadata = b'1 (INTERNALDATE "10-Sep-2024 12:00:00 +0000" RFC822)'
+    connection = FakeConnection(
+        {1: message},
+        fetch_values=[(metadata, message), b")", (metadata, message)],
+    )
+    gateway = QQIMAPGateway(_config(), connection_factory=lambda _options: connection)
+
+    with pytest.raises(IMAPProtocolError) as caught:
+        gateway.poll("internal-account", encode_cursor(Cursor(uidvalidity=7, uid=0)))
+
+    assert caught.value.phase is IMAPPhase.FETCH
 
 
 def test_each_poll_receives_a_fresh_default_ssl_context() -> None:

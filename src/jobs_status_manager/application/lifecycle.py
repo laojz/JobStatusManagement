@@ -393,12 +393,31 @@ def _knowledge_cycle(database: Database, adapters: LifecycleAdapters) -> None:
 
 async def _worker_loop(name: str, cycle: Callable[[], None]) -> None:
     """Repeat one synchronous durable cycle without blocking the event loop."""
-    while True:
-        try:
-            await anyio.to_thread.run_sync(cycle)
-        except (RuntimeError, ValueError, SQLAlchemyError) as error:
-            logger.warning("phase2_worker_failed", worker=name, error=safe_external_error(error))
-        await anyio.sleep(WORKER_INTERVAL_SECONDS)
+    is_imap_poller = name == "imap-poller"
+    if is_imap_poller:
+        logger.info(
+            "imap_poller_started",
+            component="imap_poller",
+            worker=name,
+            interval_seconds=WORKER_INTERVAL_SECONDS,
+        )
+    try:
+        while True:
+            try:
+                await anyio.to_thread.run_sync(cycle)
+            except (RuntimeError, ValueError, SQLAlchemyError) as error:
+                logger.warning(
+                    "phase2_worker_failed", worker=name, error=safe_external_error(error)
+                )
+            await anyio.sleep(WORKER_INTERVAL_SECONDS)
+    finally:
+        if is_imap_poller:
+            logger.info(
+                "imap_poller_stopped",
+                component="imap_poller",
+                worker=name,
+                interval_seconds=WORKER_INTERVAL_SECONDS,
+            )
 
 
 class ApplicationState(TypedDict):

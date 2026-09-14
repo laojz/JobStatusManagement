@@ -59,6 +59,20 @@ def _phase_error(error: IMAPError, phase: IMAPPhase) -> IMAPError:
     return error
 
 
+def _fetch_literal(
+    values: Sequence[bytes | tuple[bytes, bytes] | None],
+) -> tuple[bytes, bytes]:
+    literals = [value for value in values if isinstance(value, tuple)]
+    if (
+        len(literals) != 1
+        or any(not isinstance(value, (bytes, tuple)) for value in values)
+        or len(literals[0]) != _FETCH_PARTS
+        or not all(isinstance(part, bytes) for part in literals[0])
+    ):
+        raise IMAPProtocolError(IMAPPhase.FETCH)
+    return literals[0]
+
+
 class QQIMAPGateway:
     """Single-account, one-shot QQ IMAP polling gateway."""
 
@@ -209,14 +223,9 @@ class QQIMAPGateway:
             TimeoutError,
         ) as error:
             raise map_error(error, phase=IMAPPhase.FETCH) from None
-        if status != "OK" or len(values) != 1:
+        if status != "OK":
             raise IMAPProtocolError(IMAPPhase.FETCH)
-        item = values[0]
-        if not isinstance(item, tuple) or len(item) != _FETCH_PARTS:
-            raise IMAPProtocolError(IMAPPhase.FETCH)
-        metadata, raw_message = item
-        if not isinstance(metadata, bytes) or not isinstance(raw_message, bytes):
-            raise IMAPProtocolError(IMAPPhase.FETCH)
+        metadata, raw_message = _fetch_literal(values)
         match = _FETCH_INTERNALDATE_RE.search(metadata)
         internaldate: datetime | None = None
         if match is not None:

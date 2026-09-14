@@ -9,7 +9,9 @@ from uuid import UUID
 import pytest
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
+from structlog.testing import CapturingLogger
 
+from jobs_status_manager import mail_poller
 from jobs_status_manager.agent.contracts import ProviderError, ProviderErrorKind
 from jobs_status_manager.application_core.domain import ApplicationStatus, UserId
 from jobs_status_manager.application_core.models import OutboxEvent
@@ -25,6 +27,12 @@ from jobs_status_manager.infrastructure.adapters.fakes import (
     FakeLLM,
     FakeQQDeliveryResult,
     FakeQQGateway,
+)
+from jobs_status_manager.infrastructure.adapters.qq_imap import (
+    Cursor,
+    IMAPPhase,
+    IMAPProtocolError,
+    encode_cursor,
 )
 from jobs_status_manager.infrastructure.database.migrations import upgrade_database
 from jobs_status_manager.infrastructure.database.transactions import transaction
@@ -112,6 +120,12 @@ def _poll(setup: PipelineSetup, message: MailEnvelope) -> None:
     )
 
 
+def _capture_poll_logs(monkeypatch: pytest.MonkeyPatch) -> CapturingLogger:
+    capturing_logger = CapturingLogger()
+    monkeypatch.setattr(mail_poller, "logger", capturing_logger)
+    return capturing_logger
+
+
 def test_poll_passes_cursor_and_counts_only_new_mail(
     database: Database, settings: AppSettings, fake_clock: FakeClock
 ) -> None:
@@ -126,6 +140,65 @@ def test_poll_passes_cursor_and_counts_only_new_mail(
     assert second.ingested == 0
     assert first_gateway.calls == [("poll", ("test-account", ""))]
     assert second_gateway.calls == [("poll", ("test-account", "cursor-1"))]
+
+
+def test_successful_poll_logs_safe_counts_and_numeric_cursor(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup(database, settings, fake_clock)
+    message = _envelope("m-observed", "application received", "申请已收到")
+    next_cursor = encode_cursor(Cursor(uidvalidity=7, uid=11))
+
+    capturing_logger = _capture_poll_logs(monkeypatch)
+
+    result = poll_once(
+        setup.services,
+        setup.identity.mail_account_id,
+        FakeIMAPGateway(messages=[message], next_cursor=next_cursor),
+    )
+
+    assert result.ingested == 1
+    call = capturing_logger.calls[0]
+    assert call.method_name == "debug"
+    assert call.args == ("imap_poll_succeeded",)
+    assert call.kwargs == {
+        "account_id": setup.identity.mail_account_id,
+        "component": "imap_poller",
+        "cursor_uid": 11,
+        "cursor_uidvalidity": 7,
+        "duration_ms": call.kwargs["duration_ms"],
+        "fetched_count": 1,
+        "ingested_count": 1,
+        "outcome": "success",
+    }
+    assert isinstance(call.kwargs["duration_ms"], float)
+    assert call.kwargs["duration_ms"] >= 0
+
+
+def test_empty_poll_emits_success_event(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup(database, settings, fake_clock)
+    capturing_logger = _capture_poll_logs(monkeypatch)
+
+    result = poll_once(
+        setup.services,
+        setup.identity.mail_account_id,
+        FakeIMAPGateway(next_cursor=encode_cursor(Cursor(uidvalidity=7, uid=11))),
+    )
+
+    assert result.ingested == 0
+    call = capturing_logger.calls[0]
+    assert call.args == ("imap_poll_succeeded",)
+    assert call.kwargs["fetched_count"] == 0
+    assert call.kwargs["ingested_count"] == 0
+    assert call.kwargs["outcome"] == "empty"
 
 
 def test_poll_failure_keeps_cursor_and_records_error(
@@ -156,6 +229,46 @@ def test_poll_failure_keeps_cursor_and_records_error(
         assert row.polling_last_error == safe_external_error(RuntimeError("imap unavailable"))
 
 
+def test_typed_imap_failure_logs_safe_phase_without_advancing_cursor(
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup = _setup(database, settings, fake_clock)
+    error = IMAPProtocolError(IMAPPhase.FETCH)
+    capturing_logger = _capture_poll_logs(monkeypatch)
+
+    result = poll_once(
+        setup.services,
+        setup.identity.mail_account_id,
+        FakeIMAPGateway(error=error),
+    )
+
+    assert result.failed is True
+    with database.engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT polling_cursor FROM mail_accounts WHERE id=:account_id"),
+                {"account_id": setup.identity.mail_account_id},
+            ).scalar_one()
+            is None
+        )
+    call = capturing_logger.calls[0]
+    assert call.method_name == "warning"
+    assert call.args == ("imap_poll_failed",)
+    assert call.kwargs == {
+        "account_id": setup.identity.mail_account_id,
+        "component": "imap_poller",
+        "duration_ms": call.kwargs["duration_ms"],
+        "error": safe_external_error(error),
+        "error_type": "IMAPProtocolError",
+        "outcome": "failure",
+        "phase": "fetch",
+        "cursor_present": False,
+    }
+
+
 def test_ingestion_is_idempotent_and_non_job_stops(
     database: Database, settings: AppSettings, fake_clock: FakeClock
 ) -> None:
@@ -179,16 +292,19 @@ def test_ingestion_is_idempotent_and_non_job_stops(
 
 
 def test_empty_reset_batch_advances_explicit_cursor(
-    database: Database, settings: AppSettings, fake_clock: FakeClock
+    database: Database,
+    settings: AppSettings,
+    fake_clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     setup = _setup(database, settings, fake_clock)
 
+    next_cursor = encode_cursor(Cursor(uidvalidity=7, uid=11))
+    capturing_logger = _capture_poll_logs(monkeypatch)
     result = poll_once(
         setup.services,
         setup.identity.mail_account_id,
-        FakeIMAPGateway(
-            batch=MailPollBatch(envelopes=(), next_cursor="baseline-cursor", reset=True)
-        ),
+        FakeIMAPGateway(batch=MailPollBatch(envelopes=(), next_cursor=next_cursor, reset=True)),
     )
 
     assert result == type(result)(ingested=0, failed=False)
@@ -198,8 +314,14 @@ def test_empty_reset_batch_advances_explicit_cursor(
                 text("SELECT polling_cursor FROM mail_accounts WHERE id=:account_id"),
                 {"account_id": setup.identity.mail_account_id},
             ).scalar_one()
-            == "baseline-cursor"
+            == next_cursor
         )
+    call = capturing_logger.calls[0]
+    assert call.method_name == "info"
+    assert call.args == ("imap_cursor_reset",)
+    assert call.kwargs["outcome"] == "reset"
+    assert call.kwargs["cursor_uidvalidity"] == 7
+    assert call.kwargs["cursor_uid"] == 11
 
 
 def test_ordinary_job_mail_reaches_qq_once(
