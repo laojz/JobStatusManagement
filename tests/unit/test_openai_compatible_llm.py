@@ -4,9 +4,11 @@ from collections.abc import Callable
 import httpx2
 import pytest
 from pydantic import SecretStr
+from structlog.testing import CapturingLogger
 
 from jobs_status_manager.agent.contracts import ConversationPrompt
 from jobs_status_manager.application_core.domain import ApplicationStatus
+from jobs_status_manager.infrastructure.adapters import openai_compatible_llm
 from jobs_status_manager.infrastructure.adapters.openai_compatible_llm import (
     JsonValue,
     LLMAuthenticationError,
@@ -268,6 +270,153 @@ def test_conversation_preserves_tool_result_identity_and_registry_tools() -> Non
     assert payload["tools"][0]["type"] == "function"
     assert payload["tools"][0]["function"]["parameters"]["type"] == "object"
     assert payload["tool_choice"] == "auto"
+
+
+def test_conversation_logs_redacted_diagnostic_for_valid_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capturing_logger = CapturingLogger()
+    monkeypatch.setattr(openai_compatible_llm, "logger", capturing_logger, raising=False)
+
+    answer = "sensitive answer content"
+    prompt = "sensitive prompt text"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": answer},
+                    }
+                ]
+            },
+        )
+
+    result = _adapter(handler).converse(ConversationPrompt(user_message=prompt))
+
+    assert result.answer == answer
+    assert len(capturing_logger.calls) == 1
+    call = capturing_logger.calls[0]
+    assert call.args == ("llm_tool_response_diagnostic",)
+    assert call.kwargs == {
+        "request_kind": "conversation",
+        "finish_reason": "stop",
+        "content_present": True,
+        "content_length": len(answer),
+        "tool_call_count": 0,
+        "tool_call_types": (),
+        "tool_call_names": (),
+        "tool_call_argument_lengths": (),
+    }
+    captured = repr(call)
+    assert answer not in captured
+    assert prompt not in captured
+
+
+def test_conversation_logs_ordered_redacted_diagnostic_for_multiple_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capturing_logger = CapturingLogger()
+    monkeypatch.setattr(openai_compatible_llm, "logger", capturing_logger, raising=False)
+
+    first_arguments = '{"company":"argument-secret-one"}'
+    second_arguments = '{"query":"argument-secret-two"}'
+    provider_ids = ("provider-id-one", "provider-id-two")
+    prompt = "sensitive tool prompt"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": provider_ids[0],
+                                    "type": "function",
+                                    "function": {
+                                        "name": "SearchApplications",
+                                        "arguments": first_arguments,
+                                    },
+                                },
+                                {
+                                    "id": provider_ids[1],
+                                    "type": "function",
+                                    "function": {
+                                        "name": "SearchMails",
+                                        "arguments": second_arguments,
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                ]
+            },
+        )
+
+    result = _adapter(handler).converse(ConversationPrompt(user_message=prompt))
+
+    assert [tool_call.name for tool_call in result.tool_calls] == [
+        "SearchApplications",
+        "SearchMails",
+    ]
+    assert len(capturing_logger.calls) == 1
+    call = capturing_logger.calls[0]
+    assert call.args == ("llm_tool_response_diagnostic",)
+    assert call.kwargs == {
+        "request_kind": "conversation",
+        "finish_reason": "tool_calls",
+        "content_present": False,
+        "content_length": 0,
+        "tool_call_count": 2,
+        "tool_call_types": ("function", "function"),
+        "tool_call_names": ("SearchApplications", "SearchMails"),
+        "tool_call_argument_lengths": (len(first_arguments), len(second_arguments)),
+    }
+    captured = repr(call)
+    assert prompt not in captured
+    for provider_id in provider_ids:
+        assert provider_id not in captured
+    assert "argument-secret-one" not in captured
+    assert "argument-secret-two" not in captured
+
+
+def test_conversation_logs_redacted_diagnostic_before_blank_response_contract_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capturing_logger = CapturingLogger()
+    monkeypatch.setattr(openai_compatible_llm, "logger", capturing_logger, raising=False)
+
+    prompt = "sensitive empty response prompt"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200,
+            json={"choices": [{"finish_reason": "stop", "message": {"content": ""}}]},
+        )
+
+    with pytest.raises(LLMContractError):
+        _adapter(handler).converse(ConversationPrompt(user_message=prompt))
+
+    assert len(capturing_logger.calls) == 1
+    call = capturing_logger.calls[0]
+    assert call.args == ("llm_tool_response_diagnostic",)
+    assert call.kwargs == {
+        "request_kind": "conversation",
+        "finish_reason": "stop",
+        "content_present": True,
+        "content_length": 0,
+        "tool_call_count": 0,
+        "tool_call_types": (),
+        "tool_call_names": (),
+        "tool_call_argument_lengths": (),
+    }
+    assert prompt not in repr(call)
 
 
 def test_conversation_parses_one_function_call() -> None:

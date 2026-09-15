@@ -6,6 +6,7 @@ import json
 from typing import Final, Unpack
 
 import httpx2 as httpx
+import structlog
 from pydantic import AnyHttpUrl, SecretStr, TypeAdapter, ValidationError
 
 from jobs_status_manager.agent.contracts import (
@@ -50,6 +51,7 @@ MAX_RETRY_AFTER_SECONDS: Final = 3600.0
 HTTP_AUTH_STATUSES: Final = (401, 403)
 HTTP_RATE_LIMIT_STATUS: Final = 429
 HTTP_PROVIDER_FAILURE_MIN: Final = 500
+logger = structlog.get_logger(__name__)
 
 
 def _endpoint(base_url: AnyHttpUrl | str) -> str:
@@ -210,7 +212,24 @@ def _conversation_tools() -> list[JsonValue]:
     ]
 
 
-def _parse_tool_response(message: _Message) -> ConversationResponse:
+def _parse_tool_response(
+    message: _Message,
+    *,
+    finish_reason: str | None,
+) -> ConversationResponse:
+    logger.info(
+        "llm_tool_response_diagnostic",
+        request_kind=CONVERSATION_KIND,
+        finish_reason=finish_reason,
+        content_present=message.content is not None,
+        content_length=0 if message.content is None else len(message.content),
+        tool_call_count=len(message.tool_calls),
+        tool_call_types=tuple(call.type for call in message.tool_calls),
+        tool_call_names=tuple(call.function.name for call in message.tool_calls),
+        tool_call_argument_lengths=tuple(
+            len(call.function.arguments) for call in message.tool_calls
+        ),
+    )
     if message.content is not None and message.content.strip():
         if message.tool_calls:
             raise LLMContractError(CONVERSATION_KIND)
@@ -381,7 +400,7 @@ class OpenAICompatibleLLM:
             _conversation_messages(prompt),
             tools=_conversation_tools(),
         )
-        return _parse_tool_response(choice.message)
+        return _parse_tool_response(choice.message, finish_reason=choice.finish_reason)
 
     def close(self) -> None:
         """Close the owned HTTP client exactly once."""
