@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import anyio
+from sqlalchemy import select
 
-from jobs_status_manager.agent.contracts import PromptToolCall, ToolCallRequest
-from jobs_status_manager.agent.models import ToolCall, ToolResult
+from jobs_status_manager.agent.contracts import AgentRunState, PromptToolCall, ToolCallRequest
+from jobs_status_manager.agent.models import AgentRun, ConversationMessage, ToolCall, ToolResult
+from jobs_status_manager.agent.write_preflight import recovery_result_data
 from jobs_status_manager.infrastructure.database.transactions import transaction
 from jobs_status_manager.infrastructure.safe_errors import safe_external_error
 from jobs_status_manager.knowledge.index import IndexServices
@@ -15,9 +18,19 @@ from jobs_status_manager.knowledge.tooling import execute_knowledge
 
 if TYPE_CHECKING:
     from jobs_status_manager.agent.runtime import RuntimeServices
-    from jobs_status_manager.agent.runtime_support import RunContext
+    from jobs_status_manager.agent.runtime_support import PendingToolCall, RunContext
     from jobs_status_manager.agent.tools import ToolArguments
     from jobs_status_manager.agent.write_contracts import ToolExecution
+    from jobs_status_manager.agent.write_preflight import MalformedWrite
+
+
+@dataclass(frozen=True, slots=True)
+class WriteRecoveryRequest:
+    """Typed inputs for one malformed pending-batch recovery."""
+
+    context: RunContext
+    pending_calls: tuple[PendingToolCall, ...]
+    malformed: MalformedWrite
 
 
 def persist_tool_calls(
@@ -57,6 +70,70 @@ def persist_tool_calls(
                 )
             )
     return tuple(persisted)
+
+
+def persist_write_recovery(
+    services: RuntimeServices,
+    request: WriteRecoveryRequest,
+) -> str:
+    """Atomically persist handled batch results and one durable clarification."""
+    now = services.clock.now()
+    call_ids = tuple(pending.internal_tool_call_id for pending in request.pending_calls)
+    with transaction(services.database) as session:
+        persisted_call_ids = set(
+            session.scalars(
+                select(ToolResult.tool_call_id).where(ToolResult.tool_call_id.in_(call_ids))
+            )
+        )
+        for pending in request.pending_calls:
+            if pending.internal_tool_call_id in persisted_call_ids:
+                continue
+            session.add(
+                ToolResult(
+                    id=str(services.ids.new_id()),
+                    tool_call_id=pending.internal_tool_call_id,
+                    data=recovery_result_data(
+                        pending.internal_tool_call_id,
+                        pending.name,
+                        request.malformed,
+                    ),
+                    context_refs={},
+                    error=None,
+                    started_at=now,
+                    completed_at=now,
+                    created_at=now,
+                )
+            )
+        run = session.get(AgentRun, request.context.run_id)
+        if run is None:
+            return request.malformed.clarification
+        answer = request.malformed.clarification
+        if run.final_message_id is None:
+            message_id = str(services.ids.new_id())
+            session.add(
+                ConversationMessage(
+                    id=message_id,
+                    session_id=request.context.session_id,
+                    role="assistant",
+                    content=answer,
+                    provider_event_id=None,
+                    created_at=now,
+                )
+            )
+            session.flush()
+            run.final_message_id = message_id
+        else:
+            message = session.get(ConversationMessage, run.final_message_id)
+            if message is not None:
+                answer = message.content
+        run.state = AgentRunState.DELIVERY_PENDING.value
+        run.error = None
+        run.delivery_state = None
+        run.delivery_error = None
+        run.provider_message_id = None
+        run.next_retry_at = None
+        run.completed_at = now
+        return answer
 
 
 async def _execute_tool_async(

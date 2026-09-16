@@ -1024,36 +1024,6 @@ def test_runtime_rejects_ninth_tool_and_forbidden_write(
         assert connection.execute(text("SELECT COUNT(*) FROM pending_actions")).scalar_one() == 1
         assert connection.execute(text("SELECT COUNT(*) FROM applications")).scalar_one() == 0
 
-    with database.engine.begin() as connection:
-        connection.execute(text("DELETE FROM tool_results"))
-        connection.execute(text("DELETE FROM tool_calls"))
-        connection.execute(
-            text("UPDATE agent_runs SET state='RUNNING', error=NULL, completed_at=NULL")
-        )
-    malformed = FakeLLM(
-        conversation_responses=[
-            ConversationResponse(
-                tool_calls=(
-                    ToolCallRequest(
-                        provider_call_id="provider-write-2",
-                        provider_type="function",
-                        name="UpdateApplicationStatus",
-                        arguments={"company": "腾讯", "position": "后端", "status": "INTERVIEW"},
-                        arguments_json='{"company":"腾讯","position":"后端","status":"INTERVIEW"}',
-                    ),
-                )
-            )
-        ]
-    )
-    process_run(RuntimeServices(database, malformed, FakeQQGateway(), fake_clock, ids), "run")
-    with database.engine.connect() as connection:
-        assert connection.execute(text("SELECT state FROM agent_runs")).scalar_one() == "FAILED"
-        assert connection.execute(text("SELECT COUNT(*) FROM pending_actions")).scalar_one() == 1
-        assert (
-            "malformed arguments"
-            in connection.execute(text("SELECT error FROM tool_results")).scalar_one()
-        )
-
 
 def test_write_proposal_freezes_arguments_and_confirmation_executes_once(
     database: Database,

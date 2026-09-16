@@ -143,23 +143,34 @@ def load_context(database: Database, run_id: str) -> RunContext | None:  # noqa:
                 .order_by(ConversationMessage.created_at, ConversationMessage.id)
             ).all()[-MAX_RECENT_MESSAGES:]
         )
-        try:
-            tool_state = load_tool_state(session, run.id)
-        except ToolContinuationStateError as error:
-            run.state = AgentRunState.FAILED.value
-            run.error = str(error)
-            if session_row.active_run_id == run.id:
-                session_row.active_run_id = None
-            return None
-        pending_calls = tuple(
-            PendingToolCall(call_id, name, arguments)
-            for call_id, name, arguments in tool_state.pending_calls
-        )
         final_message = (
             session.get(ConversationMessage, run.final_message_id)
             if run.final_message_id is not None
             else None
         )
+        if run.state == AgentRunState.DELIVERY_PENDING.value and final_message is not None:
+            tool_calls: tuple[PromptToolCall, ...] = ()
+            tool_results: tuple[PromptToolResult, ...] = ()
+            pending_calls: tuple[PendingToolCall, ...] = ()
+            next_sequence = 1
+            next_assistant_sequence = 1
+        else:
+            try:
+                tool_state = load_tool_state(session, run.id)
+            except ToolContinuationStateError as error:
+                run.state = AgentRunState.FAILED.value
+                run.error = str(error)
+                if session_row.active_run_id == run.id:
+                    session_row.active_run_id = None
+                return None
+            tool_calls = tool_state.tool_calls
+            tool_results = tool_state.tool_results
+            pending_calls = tuple(
+                PendingToolCall(call_id, name, arguments)
+                for call_id, name, arguments in tool_state.pending_calls
+            )
+            next_sequence = tool_state.next_sequence
+            next_assistant_sequence = tool_state.next_assistant_sequence
         try:
             reply_target = reply_target_from_message(message)
         except ReplyTargetError as error:
@@ -179,10 +190,10 @@ def load_context(database: Database, run_id: str) -> RunContext | None:  # noqa:
             active_knowledge_document_id=session_row.active_knowledge_document_id,
             recent_messages=recent_messages,
             user_message=message.content,
-            tool_calls=tool_state.tool_calls,
-            tool_results=tool_state.tool_results,
-            next_sequence=tool_state.next_sequence,
-            next_assistant_sequence=tool_state.next_assistant_sequence,
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+            next_sequence=next_sequence,
+            next_assistant_sequence=next_assistant_sequence,
             pending_tool_calls=pending_calls,
             final_message_id=run.final_message_id,
             final_message_content=None if final_message is None else final_message.content,

@@ -40,6 +40,17 @@ WRITE_TOOL_NAME: Final = "UpdateApplicationStatus"
 ADD_KNOWLEDGE_TOOL: Final = "AddKnowledge"
 REMOVE_KNOWLEDGE_TOOL: Final = "RemoveKnowledge"
 WRITE_TOOL_NAMES: Final = (WRITE_TOOL_NAME, ADD_KNOWLEDGE_TOOL, REMOVE_KNOWLEDGE_TOOL)
+WRITE_TOOL_DESCRIPTIONS: Final = {
+    WRITE_TOOL_NAME: (
+        "Propose UpdateApplicationStatus only when company, optional department, position, "
+        "status, and any applicable interview_round are facts from the user or unambiguous "
+        "persisted context; never infer them. Ask for clarification otherwise. INTERVIEW "
+        "requires a positive interview_round; non-INTERVIEW statuses must omit "
+        "interview_round. Confirmation is required."
+    ),
+    ADD_KNOWLEDGE_TOOL: "Propose AddKnowledge; confirmation is required.",
+    REMOVE_KNOWLEDGE_TOOL: "Propose RemoveKnowledge; confirmation is required.",
+}
 type ToolArguments = dict[str, str | int | bool | None]
 type WriteToolName = Literal["UpdateApplicationStatus", "AddKnowledge", "RemoveKnowledge"]
 
@@ -116,7 +127,7 @@ def definitions() -> tuple[ToolDefinition, ...]:
         *(
             ToolDefinition(
                 name=name,
-                description=f"Propose {name}; confirmation is required",
+                description=WRITE_TOOL_DESCRIPTIONS[name],
                 category="COMMAND",
                 permission=ToolPermission.WRITE,
                 requires_confirmation=True,

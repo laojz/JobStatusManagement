@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import time
-from dataclasses import replace
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, assert_never
 
 import anyio
-from pydantic import ValidationError
 
 from jobs_status_manager.agent.contracts import (
     ConversationPrompt,
@@ -19,10 +18,11 @@ from jobs_status_manager.agent.runtime_support import (
     RunContext,
     execute_tool,
     persist_tool_calls,
-    persist_tool_error,
     update_active_context,
 )
+from jobs_status_manager.agent.tool_runtime import WriteRecoveryRequest, persist_write_recovery
 from jobs_status_manager.agent.tools import WRITE_TOOL_NAMES
+from jobs_status_manager.agent.write_preflight import preflight_confirmation_writes
 from jobs_status_manager.agent.write_runtime import (
     propose_agent_write,
     record_confirmation_delivery,
@@ -33,6 +33,33 @@ from jobs_status_manager.infrastructure.safe_errors import safe_external_error
 if TYPE_CHECKING:
     from jobs_status_manager.agent.runtime import RuntimeServices
     from jobs_status_manager.infrastructure.database.connection import Database
+
+
+@dataclass(frozen=True, slots=True)
+class _RunTurnsAnswer:
+    answer: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RunTurnsSuspended:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _RunTurnsFailure:
+    error: str
+    retryable: bool = False
+
+
+type _RunTurnsOutcome = _RunTurnsAnswer | _RunTurnsSuspended | _RunTurnsFailure
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingToolsContinue:
+    context: RunContext
+
+
+type _PendingToolsOutcome = _RunTurnsOutcome | _PendingToolsContinue
 
 
 def _converse(
@@ -102,25 +129,27 @@ def _resume_pending_tools(
     services: RuntimeServices,
     context: RunContext,
     tool_results: list[PromptToolResult],
-) -> tuple[RunContext, str | None, bool]:
+) -> _PendingToolsOutcome:
     pending_calls = context.pending_tool_calls
+    malformed = preflight_confirmation_writes(pending_calls)
+    if malformed is not None:
+        answer = persist_write_recovery(
+            services,
+            WriteRecoveryRequest(context, pending_calls, malformed),
+        )
+        return _RunTurnsAnswer(answer)
     for index, pending in enumerate(pending_calls):
         if pending.name in WRITE_TOOL_NAMES:
-            try:
-                result = propose_agent_write(
-                    services,
-                    context,
-                    pending.internal_tool_call_id,
-                    pending.name,
-                    pending.arguments,
-                )
-            except ValidationError:
-                error = "malformed arguments for UpdateApplicationStatus"
-                persist_tool_error(services, pending.internal_tool_call_id, error)
-                return context, error, False
+            result = propose_agent_write(
+                services,
+                context,
+                pending.internal_tool_call_id,
+                pending.name,
+                pending.arguments,
+            )
             if result.confirmation_prompt is not None:
                 _deliver_confirmation_prompt(services, context, result.confirmation_prompt)
-            return context, None, True
+            return _RunTurnsSuspended()
         error, result = execute_tool(
             services,
             context,
@@ -129,7 +158,7 @@ def _resume_pending_tools(
             pending.arguments,
         )
         if result is None:
-            return context, error, False
+            return _RunTurnsFailure(error)
         tool_results.append(
             PromptToolResult(
                 internal_tool_call_id=pending.internal_tool_call_id,
@@ -143,7 +172,7 @@ def _resume_pending_tools(
             tool_results,
             pending_calls[index + 1 :],
         )
-    return context, None, False
+    return _PendingToolsContinue(context)
 
 
 def _deliver_confirmation_prompt(
@@ -179,39 +208,36 @@ def _deliver_confirmation_prompt(
         )
 
 
-def run_turns(
+def _run_turns(
     services: RuntimeServices,
     context: RunContext,
-) -> tuple[str | None, str | None, bool]:
-    """Run a bounded sequence of LLM responses and persisted tool calls."""
+) -> _RunTurnsOutcome:
     started = time.monotonic()
     context = update_active_context(services.database, context)
     tool_results = list(context.tool_results)
-    context, tool_error, suspended = _resume_pending_tools(services, context, tool_results)
-    if tool_error is not None:
-        return None, tool_error, False
-    if suspended:
-        return None, None, False
-    answer: str | None = None
-    error: str | None = None
-    retryable = False
+    pending_outcome = _resume_pending_tools(services, context, tool_results)
+    match pending_outcome:
+        case _PendingToolsContinue(context=continued_context):
+            context = continued_context
+        case _RunTurnsAnswer() | _RunTurnsSuspended() | _RunTurnsFailure():
+            return pending_outcome
+        case unreachable:
+            assert_never(unreachable)
     while True:
         response, response_error, response_retryable = _next_response(
             services, context, tool_results, started
         )
         if response is None:
-            error = response_error
-            retryable = response_retryable
-            break
+            return _RunTurnsFailure(
+                response_error or "conversation request failed",
+                response_retryable,
+            )
         if response.answer is not None:
-            answer = response.answer
-            break
+            return _RunTurnsAnswer(response.answer)
         if not response.tool_calls:
-            error = "conversation response contained neither answer nor tool calls"
-            break
+            return _RunTurnsFailure("conversation response contained neither answer nor tool calls")
         if len(context.tool_calls) + len(response.tool_calls) > services.max_tool_calls:
-            error = "agent run exceeded tool-call limit"
-            break
+            return _RunTurnsFailure("agent run exceeded tool-call limit")
         persisted_calls = persist_tool_calls(services, context, response.tool_calls)
         pending_calls = tuple(
             PendingToolCall(
@@ -228,14 +254,28 @@ def run_turns(
             next_assistant_sequence=context.next_assistant_sequence + 1,
             pending_tool_calls=pending_calls,
         )
-        context, tool_error, suspended = _resume_pending_tools(services, context, tool_results)
-        if suspended:
+        pending_outcome = _resume_pending_tools(services, context, tool_results)
+        match pending_outcome:
+            case _PendingToolsContinue(context=continued_context):
+                context = continued_context
+            case _RunTurnsAnswer() | _RunTurnsSuspended() | _RunTurnsFailure():
+                return pending_outcome
+            case unreachable:
+                assert_never(unreachable)
+
+
+def run_turns(
+    services: RuntimeServices,
+    context: RunContext,
+) -> tuple[str | None, str | None, bool]:
+    """Run a bounded sequence of LLM responses and persisted tool calls."""
+    outcome = _run_turns(services, context)
+    match outcome:
+        case _RunTurnsAnswer(answer=answer):
+            return answer, None, False
+        case _RunTurnsSuspended():
             return None, None, False
-        if tool_error is not None:
-            error = tool_error
-            break
-    return (
-        answer,
-        error or (None if answer is not None else "agent run exceeded tool-call limit"),
-        retryable if error is not None else False,
-    )
+        case _RunTurnsFailure(error=error, retryable=retryable):
+            return None, error, retryable
+        case unreachable:
+            assert_never(unreachable)
